@@ -145,8 +145,9 @@ PSNode *LLVMPointerSubgraphBuilder::getOperand(const llvm::Value *val)
     if (!op) {
         if (isInvalid(val))
             return UNKNOWN_MEMORY;
-        else
-            return buildNode(val);
+
+        assert(0 && "Did not created relevant value");
+        abort();
     } else
         return op;
 }
