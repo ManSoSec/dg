@@ -124,12 +124,20 @@ class LLVMPointerAnalysis
 {
     PointerSubgraph *PS = nullptr;
     LLVMPointerSubgraphBuilder *builder;
+    llvm::Function *entry = nullptr;
 
 public:
 
     LLVMPointerAnalysis(const llvm::Module *m,
                         uint64_t field_sensitivity = Offset::UNKNOWN)
         : builder(new LLVMPointerSubgraphBuilder(m, field_sensitivity)) {}
+
+    LLVMPointerAnalysis(const llvm::Module *m, llvm::Function *entry,
+                        uint64_t field_sensitivity = Offset::UNKNOWN)
+        : builder(new LLVMPointerSubgraphBuilder(m, field_sensitivity))
+    {
+        this->entry = entry;
+    }
 
     ~LLVMPointerAnalysis()
     {
@@ -164,7 +172,10 @@ public:
     void run()
     {
         // build the subgraph
-        PS = builder->buildLLVMPointerSubgraph();
+	if(this->entry)
+            PS = builder->buildLLVMPointerSubgraph(this->entry);
+	else
+	    PS = builder->buildLLVMPointerSubgraph();
         if (!PS) {
             llvm::errs() << "Pointer Subgraph was not built, aborting\n";
             abort();

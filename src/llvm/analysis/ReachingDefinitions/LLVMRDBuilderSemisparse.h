@@ -31,6 +31,12 @@ public:
                   bool pure_funs = false)
         : LLVMRDBuilder(m, p, pure_funs) {}
 
+    LLVMRDBuilderSemisparse(const llvm::Module *m,
+                  LLVMPointerAnalysis *p,
+                  const llvm::Function *entry,
+                  bool pure_funs = false)
+        : LLVMRDBuilder(m, p, entry, pure_funs) {}
+
     virtual ~LLVMRDBuilderSemisparse() = default;
 
     RDNode *build() override;

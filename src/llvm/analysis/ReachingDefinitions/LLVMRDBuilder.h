@@ -21,6 +21,7 @@ class LLVMRDBuilder
 protected:
     const llvm::Module *M;
     const llvm::DataLayout *DL;
+    const llvm::Function *entry;
     bool assume_pure_functions;
 
     struct Subgraph {
@@ -55,6 +56,13 @@ public:
                   dg::LLVMPointerAnalysis *p,
                   bool pure_funs = false)
         : M(m), DL(new llvm::DataLayout(m)),
+          assume_pure_functions(pure_funs), PTA(p) {}
+
+    LLVMRDBuilder(const llvm::Module *m,
+                  dg::LLVMPointerAnalysis *p,
+                  const llvm::Function *entry = nullptr,
+                  bool pure_funs = false)
+        : M(m), DL(new llvm::DataLayout(m)), entry(entry),
           assume_pure_functions(pure_funs), PTA(p) {}
 
     virtual ~LLVMRDBuilder() {

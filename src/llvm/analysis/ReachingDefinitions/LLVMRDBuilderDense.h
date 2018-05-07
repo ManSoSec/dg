@@ -23,6 +23,13 @@ public:
                   dg::LLVMPointerAnalysis *p,
                   bool pure_funs = false)
         : LLVMRDBuilder(m, p, pure_funs) {}
+
+    LLVMRDBuilderDense(const llvm::Module *m,
+                  dg::LLVMPointerAnalysis *p,
+                  const llvm::Function *entry = nullptr,
+                  bool pure_funs = false)
+        : LLVMRDBuilder(m, p, entry, pure_funs) {}
+    
     virtual ~LLVMRDBuilderDense() = default;
 
     RDNode *build() override;

@@ -859,9 +859,16 @@ LLVMRDBuilderDense::createCall(const llvm::Instruction *Inst)
 RDNode *LLVMRDBuilderDense::build()
 {
     // get entry function
-    llvm::Function *F = M->getFunction("main");
-    if (!F) {
-        llvm::errs() << "Need main function in module\n";
+    // llvm::Function *F = M->getFunction("main");
+    // if (!F) {
+    //     llvm::errs() << "Need main function in module\n";
+    //     abort();
+    // }
+    
+    llvm::errs() << this->entry;
+    // get entry function
+    if (!this->entry) {
+        llvm::errs() << "No entry function found/given\n";
         abort();
     }
 
@@ -870,7 +877,7 @@ RDNode *LLVMRDBuilderDense::build()
 
     // now we can build rest of the graph
     RDNode *root, *ret;
-    std::tie(root, ret) = buildFunction(*F);
+    std::tie(root, ret) = buildFunction(*entry);
     assert(root && "Do not have a root node of a function");
     assert(ret && "Do not have a ret node of a function");
 

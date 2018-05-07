@@ -87,7 +87,8 @@ public:
 
     ~LLVMPointerSubgraphBuilder();
 
-    PointerSubgraph *buildLLVMPointerSubgraph();
+    // PointerSubgraph *buildLLVMPointerSubgraph();
+    PointerSubgraph *buildLLVMPointerSubgraph(llvm::Function *entry = nullptr);
 
     // create subgraph of function @F (the nodes)
     // and call+return nodes to/from it. This function

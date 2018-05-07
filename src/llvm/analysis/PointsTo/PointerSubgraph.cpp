@@ -1820,12 +1820,17 @@ void LLVMPointerSubgraphBuilder::addInterproceduralOperands(const llvm::Function
 }
 
 
-PointerSubgraph *LLVMPointerSubgraphBuilder::buildLLVMPointerSubgraph()
+PointerSubgraph *LLVMPointerSubgraphBuilder::buildLLVMPointerSubgraph(llvm::Function *entry)
 {
     // get entry function
-    llvm::Function *F = M->getFunction("main");
-    if (!F) {
-        llvm::errs() << "Need main function in module\n";
+    // llvm::Function *F = M->getFunction("main");
+    // if (!F) {
+    //     llvm::errs() << "Need main function in module\n";
+    //     abort();
+    //}
+
+    if (!entry) {
+        llvm::errs() << "No entry function found/given\n";
         abort();
     }
 
@@ -1833,7 +1838,7 @@ PointerSubgraph *LLVMPointerSubgraphBuilder::buildLLVMPointerSubgraph()
     PSNodesSeq glob = buildGlobals();
 
     // now we can build rest of the graph
-    PSNode *root = buildFunction(*F);
+    PSNode *root = buildFunction(*entry);
 
     // fill in the CFG edges
     addProgramStructure();
