@@ -102,6 +102,11 @@ llvm::cl::opt<std::string> slicing_criteria("c", llvm::cl::Required,
                    "function calls, e.g. -c foo,bar\n"), llvm::cl::value_desc("func"),
                    llvm::cl::init(""), llvm::cl::cat(SlicingOpts));
 
+llvm::cl::opt<std::string> entrypoint("entrypoint",
+    llvm::cl::desc("Define custom entrypoint in the file. The slicer considers main\n"
+                   "if this option is not set\n"),
+                   llvm::cl::init(""), llvm::cl::cat(SlicingOpts));
+
 llvm::cl::opt<bool> remove_slicing_criteria("remove-slicing-criteria",
     llvm::cl::desc("By default, slicer keeps also calls to the slicing criteria\n"
                    "in the sliced program. This switch makes slicer to remove\n"
@@ -202,9 +207,10 @@ static void annotate(llvm::Module *M, AnnotationOptsT opts,
     delete annot;
 }
 
-static bool createEmptyMain(llvm::Module *M)
+static bool createEmptyMain(llvm::Module *M, llvm::Function *entry)
 {
-    llvm::Function *main_func = M->getFunction("main");
+    // llvm::Function *main_func = M->getFunction("main");
+    llvm::Function *main_func = entry;
     if (!main_func) {
         errs() << "No main function found in module. This seems like bug since\n"
                   "here we should have the graph build from main\n";
@@ -262,6 +268,7 @@ class Slicer {
 protected:
     llvm::Module *M;
     AnnotationOptsT opts{};
+    llvm::Function *entry;
     std::unique_ptr<LLVMPointerAnalysis> PTA;
     std::unique_ptr<LLVMReachingDefinitions> RD;
     LLVMDependenceGraph dg;
@@ -306,6 +313,15 @@ public:
                                      rd_strong_update_unknown, undefined_are_pure)) {
         assert(mod && "Need module");
     }
+
+    Slicer(llvm::Module *mod, AnnotationOptsT o, llvm::Function *entry)
+     :M(mod), opts(o), entry(entry),
+      PTA(new LLVMPointerAnalysis(mod, entry, pta_field_sensitivie)),
+       RD(new LLVMReachingDefinitions(mod, PTA.get(), entry,
+                                      rd_strong_update_unknown, undefined_are_pure)) {
+         assert(mod && "Need module");
+     }
+
     const LLVMDependenceGraph& getDG() const { return dg; }
     LLVMDependenceGraph& getDG() { return dg; }
 
@@ -345,7 +361,7 @@ public:
         // only empty main will stay there. Just delete the body
         // of main and keep the return value
         if (!got_slicing_criteria)
-            return createEmptyMain(M);
+            return createEmptyMain(M, entry);
 
         // unmark this set of nodes after marking the relevant ones.
         // Used to mimic the Weissers algorithm
@@ -421,7 +437,6 @@ public:
     virtual bool buildDG()
     {
         debug::TimeMeasure tm;
-
         tm.start();
 
         if (pta == PtaType::fs)
@@ -435,8 +450,8 @@ public:
 
         tm.stop();
         tm.report("INFO: Points-to analysis took");
-
-        dg.build(&*M, PTA.get());
+	
+        dg.build(&*M, PTA.get(), entry);
 
         // verify if the graph is built correctly
         // FIXME - do it optionally (command line argument)
@@ -788,10 +803,20 @@ int main(int argc, char *argv[])
         return save_module(M, should_verify_module);
     }
 
+    // Get entrypoint
+    llvm::Function *entry = M->getFunction(entrypoint);
+    if(entrypoint == "")
+        entry = M->getFunction("main");
+    if(!entry)
+    {
+        errs() << "No entry function found/given\n";
+        abort();
+    }
+
     /// ---------------
     // slice the code
     /// ---------------
-    Slicer slicer(M, opts);
+    Slicer slicer(M, opts, entry);
 
     // build the dependence graph, so that we can dump it if desired
     if (!slicer.buildDG()) {
