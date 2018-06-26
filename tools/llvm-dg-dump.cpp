@@ -172,7 +172,7 @@ int main(int argc, char *argv[])
         abort();
     }
 
-    tm.report("INFO: Points-to analysis took");
+    //tm.report("INFO: Points-to analysis took");
 
     d.build(M, PTA, entry);
 
@@ -187,7 +187,7 @@ int main(int argc, char *argv[])
         tm.start();
         d.getCallSites(sc, &callsites);
         tm.stop();
-        tm.report("INFO: Finding slicing criterions took");
+        //tm.report("INFO: Finding slicing criterions took");
     }
 
     assert(PTA && "BUG: Need points-to analysis");
@@ -208,13 +208,13 @@ int main(int argc, char *argv[])
         abort();
     }
     tm.stop();
-    tm.report("INFO: Reaching defs analysis took");
+    //tm.report("INFO: Reaching defs analysis took");
 
     LLVMDefUseAnalysis DUA(&d, &RDA, PTA);
     tm.start();
     DUA.run(); // add def-use edges according that
     tm.stop();
-    tm.report("INFO: Adding Def-Use edges took");
+    //tm.report("INFO: Adding Def-Use edges took");
 
     // we won't need PTA anymore
     delete PTA;
@@ -223,7 +223,7 @@ int main(int argc, char *argv[])
     // add post-dominator frontiers
     d.computeControlDependencies(cd_alg);
     tm.stop();
-    tm.report("INFO: computing control dependencies took");
+    //tm.report("INFO: computing control dependencies took");
 
     if (slicing_criterion) {
         LLVMSlicer slicer;

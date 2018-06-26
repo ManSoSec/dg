@@ -252,15 +252,16 @@ LLVMDependenceGraph::buildSubgraph(LLVMNode *node, llvm::Function *callFunc)
 
         // make the real work
 #ifndef NDEBUG
-        bool ret =
+        bool ret =  
 #endif
+	//llvm::errs() << callFunc ;
         subgraph->build(callFunc);
 
 #ifndef NDEBUG
         // at least for now use just assert, if we'll
         // have a reason to handle such failures at some
         // point, we can change it
-        assert(ret && "Building subgraph failed");
+         assert(ret && "Building subgraph failed");
 #endif
 
         // we built the subgraph, so it has refcount = 1,
@@ -366,8 +367,8 @@ void LLVMDependenceGraph::handleInstruction(llvm::Value *val,
                         // is only declaration
                         continue;
 
-                    LLVMDependenceGraph *subg = buildSubgraph(node, F);
-                    node->addSubgraph(subg);
+                    //LLVMDependenceGraph *subg = buildSubgraph(node, F);
+                    //node->addSubgraph(subg);
                 }
             } else
                 llvmutils::printerr("Had no PTA node", strippedValue);
@@ -379,8 +380,8 @@ void LLVMDependenceGraph::handleInstruction(llvm::Value *val,
         }
 
         if (is_func_defined(func)) {
-            LLVMDependenceGraph *subg = buildSubgraph(node, func);
-            node->addSubgraph(subg);
+            //LLVMDependenceGraph *subg = buildSubgraph(node, func);
+            //node->addSubgraph(subg);
         }
 
         // if we allocate a memory in a function, we can pass

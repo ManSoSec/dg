@@ -511,6 +511,7 @@ static bool remove_unused_from_module(llvm::Module *M)
     // do not slice away these functions no matter what
     // FIXME do it a vector and fill it dynamically according
     // to what is the setup (like for sv-comp or general..)
+    // const char *keep[] = {"main", "klee_assume", NULL};
     const char *keep[] = {"main", "klee_assume", NULL};
 
     // when erasing while iterating the slicer crashes
@@ -789,6 +790,16 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    // Get entrypoint
+    llvm::Function *entry = M->getFunction(entrypoint);
+    if(entrypoint == "")
+        entry = M->getFunction("main");
+    if(!entry)
+    {
+        errs() << "No entry function found/given\n";
+        abort();
+    }
+
     if (statistics)
         print_statistics(M, "Statistics before ");
 
@@ -801,16 +812,6 @@ int main(int argc, char *argv[])
             print_statistics(M, "Statistics after ");
 
         return save_module(M, should_verify_module);
-    }
-
-    // Get entrypoint
-    llvm::Function *entry = M->getFunction(entrypoint);
-    if(entrypoint == "")
-        entry = M->getFunction("main");
-    if(!entry)
-    {
-        errs() << "No entry function found/given\n";
-        abort();
     }
 
     /// ---------------

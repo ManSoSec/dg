@@ -865,7 +865,7 @@ RDNode *LLVMRDBuilderDense::build()
     //     abort();
     // }
     
-    llvm::errs() << this->entry;
+    //llvm::errs() << this->entry;
     // get entry function
     if (!this->entry) {
         llvm::errs() << "No entry function found/given\n";

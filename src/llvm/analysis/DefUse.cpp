@@ -274,7 +274,9 @@ void LLVMDefUseAnalysis::addDataDependence(LLVMNode *node, llvm::Value *rdval)
         llvm::Function *F
             = llvm::cast<llvm::Instruction>(rdval)->getParent()->getParent();
         LLVMNode *entryNode = dg->getGlobalNode(F);
-        assert(entryNode && "Don't have built function");
+        //assert(entryNode && "Don't have built function");
+	if (!entryNode)
+	    return;
 
         // get the graph where the node lives
         LLVMDependenceGraph *graph = entryNode->getDG();
