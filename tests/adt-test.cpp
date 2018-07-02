@@ -5,6 +5,7 @@
 #include "test-runner.h"
 
 #include "ADT/Queue.h"
+#include "ADT/Bitvector.h"
 #include "analysis/ReachingDefinitions/RDMap.h"
 
 using namespace dg::ADT;
@@ -148,8 +149,6 @@ public:
         check(!intervalsOverlap(1, 2, 3, 3), "BUG: intervals should not overlap");
     }
 };
-
-
 
 }; // namespace tests
 }; // namespace dg

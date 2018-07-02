@@ -28,6 +28,8 @@
 #include <llvm/IR/Constant.h>
 #include <llvm/Support/raw_os_ostream.h>
 
+#include <llvm/IR/Dominators.h>
+
 #if (__clang__)
 #pragma clang diagnostic pop // ignore -Wunused-parameter
 #else
@@ -36,6 +38,7 @@
 
 #include "analysis/PointsTo/PointerSubgraph.h"
 #include "llvm/analysis/PointsTo/PointerSubgraphValidator.h"
+#include "analysis/PointsTo/PointerSubgraphOptimizations.h"
 #include "PointerSubgraph.h"
 
 namespace dg {
@@ -44,290 +47,21 @@ namespace pta {
 
 using dg::MemAllocationFuncs;
 
-static inline unsigned getPointerBitwidth(const llvm::DataLayout *DL,
-                                          const llvm::Value *ptr)
-
-{
-    const llvm::Type *Ty = ptr->getType();
-    return DL->getPointerSizeInBits(Ty->getPointerAddressSpace());
-}
-
-static uint64_t getConstantValue(const llvm::Value *op)
-{
-    using namespace llvm;
-
-    //XXX: we should get rid of this dependency
-    static_assert(sizeof(Offset::type) == sizeof(uint64_t),
-                  "The code relies on Offset::type having 8 bytes");
-
-    uint64_t size = Offset::UNKNOWN;
-    if (const ConstantInt *C = dyn_cast<ConstantInt>(op)) {
-        size = C->getLimitedValue();
-    }
-
-    // size is ~((uint64_t)0) if it is unknown
-    return size;
-}
-
-// get size of memory allocation argument
-static uint64_t getConstantSizeValue(const llvm::Value *op) {
-    auto sz = getConstantValue(op);
-    // if the size is unknown, make it 0, so that pointer
-    // analysis correctly computes offets into this memory
-    // (which is always UNKNOWN)
-    if (sz == ~static_cast<uint64_t>(0))
-        return 0;
-    return sz;
-}
-
-static uint64_t getAllocatedSize(const llvm::AllocaInst *AI,
-                                 const llvm::DataLayout *DL)
-{
-    llvm::Type *Ty = AI->getAllocatedType();
-    if (!Ty->isSized())
-            return 0;
-
-    if (AI->isArrayAllocation()) {
-        return getConstantSizeValue(AI->getArraySize()) * DL->getTypeAllocSize(Ty);
-    } else
-        return DL->getTypeAllocSize(Ty);
-}
-
-bool LLVMPointerSubgraphBuilder::typeCanBePointer(llvm::Type *Ty) const
-{
-    if (Ty->isPointerTy())
-        return true;
-
-    if (Ty->isIntegerTy() && Ty->isSized())
-        return DL->getTypeSizeInBits(Ty)
-                >= DL->getPointerSizeInBits(/*Ty->getPointerAddressSpace()*/);
-
-    return false;
-}
-
 LLVMPointerSubgraphBuilder::~LLVMPointerSubgraphBuilder()
 {
     delete DL;
 }
 
-Pointer LLVMPointerSubgraphBuilder::handleConstantPtrToInt(const llvm::PtrToIntInst *P2I)
-{
-    using namespace llvm;
-
-    const Value *llvmOp = P2I->getOperand(0);
-    // (possibly recursively) get the operand of this bit-cast
-    PSNode *op = getOperand(llvmOp);
-    assert(op->pointsTo.size() == 1
-           && "Constant PtrToInt with not only one pointer");
-
-    return *op->pointsTo.begin();
+void dump(const llvm::BasicBlock& b) {
+    llvm::errs() << b << "\n";
 }
 
-Pointer LLVMPointerSubgraphBuilder::handleConstantIntToPtr(const llvm::IntToPtrInst *I2P)
-{
-    using namespace llvm;
-
-    const Value *llvmOp = I2P->getOperand(0);
-    if (isa<ConstantInt>(llvmOp)) {
-        llvm::errs() << "IntToPtr with constant: " << *I2P << "\n";
-        return PointerUnknown;
-    }
-
-    // (possibly recursively) get the operand of this bit-cast
-    PSNode *op = getOperand(llvmOp);
-    assert(op->pointsTo.size() == 1
-           && "Constant PtrToInt with not only one pointer");
-
-    return *op->pointsTo.begin();
+void dump(const llvm::Instruction& I) {
+    llvm::errs() << I << "\n";
 }
 
-Pointer LLVMPointerSubgraphBuilder::handleConstantAdd(const llvm::Instruction *Inst)
-{
-    using namespace llvm;
-
-    PSNode *op;
-    const Value *val = nullptr;
-    Offset off = Offset::UNKNOWN;
-
-    // see createAdd() for details
-    if (isa<ConstantInt>(Inst->getOperand(0))) {
-        op = getOperand(Inst->getOperand(1));
-        val = Inst->getOperand(0);
-    } else if (isa<ConstantInt>(Inst->getOperand(1))) {
-        op = getOperand(Inst->getOperand(0));
-        val = Inst->getOperand(1);
-    } else {
-        op = tryGetOperand(Inst->getOperand(0));
-        if (!op)
-            op = tryGetOperand(Inst->getOperand(1));
-
-        if (!op)
-            return createUnknown(Inst);
-    }
-
-    assert(op && "Don't have operand for add");
-    if (val)
-        off = getConstantValue(val);
-
-    assert(op->pointsTo.size() == 1
-           && "Constant add with not only one pointer");
-
-    Pointer ptr = *op->pointsTo.begin();
-    if (off.isUnknown())
-        return Pointer(ptr.target, Offset::UNKNOWN);
-    else
-        return Pointer(ptr.target, ptr.offset + off);
-}
-
-Pointer LLVMPointerSubgraphBuilder::handleConstantArithmetic(const llvm::Instruction *Inst)
-{
-    using namespace llvm;
-
-    PSNode *op;
-
-    if (isa<ConstantInt>(Inst->getOperand(0))) {
-        op = getOperand(Inst->getOperand(1));
-    } else if (isa<ConstantInt>(Inst->getOperand(1))) {
-        op = getOperand(Inst->getOperand(0));
-    } else {
-        op = tryGetOperand(Inst->getOperand(0));
-        if (!op)
-            op = tryGetOperand(Inst->getOperand(1));
-
-        if (!op)
-            return createUnknown(Inst);
-    }
-
-    assert(op && "Don't have operand for add");
-    assert(op->pointsTo.size() == 1
-           && "Constant add with not only one pointer");
-
-    Pointer ptr = *op->pointsTo.begin();
-    return Pointer(ptr.target, Offset::UNKNOWN);
-}
-
-Pointer LLVMPointerSubgraphBuilder::handleConstantBitCast(const llvm::BitCastInst *BC)
-{
-    using namespace llvm;
-
-    if (!BC->isLosslessCast()) {
-        errs() << "WARN: Not a loss less cast unhandled ConstExpr"
-               << *BC << "\n";
-        abort();
-        return PointerUnknown;
-    }
-
-    const Value *llvmOp = BC->stripPointerCasts();
-    // (possibly recursively) get the operand of this bit-cast
-    PSNode *op = getOperand(llvmOp);
-    assert(op->pointsTo.size() == 1
-           && "Constant BitCast with not only one pointer");
-
-    return *op->pointsTo.begin();
-}
-
-Pointer LLVMPointerSubgraphBuilder::handleConstantGep(const llvm::GetElementPtrInst *GEP)
-{
-    using namespace llvm;
-
-    const Value *op = GEP->getPointerOperand();
-    Pointer pointer(UNKNOWN_MEMORY, Offset::UNKNOWN);
-
-    // get operand PSNode (this may result in recursive call,
-    // if this gep is recursively defined)
-    PSNode *opNode = getOperand(op);
-    assert(opNode->pointsTo.size() == 1
-           && "Constant node has more that 1 pointer");
-    pointer = *(opNode->pointsTo.begin());
-
-    unsigned bitwidth = getPointerBitwidth(DL, op);
-    APInt offset(bitwidth, 0);
-
-    // get offset of this GEP
-    if (GEP->accumulateConstantOffset(*DL, offset)) {
-        if (offset.isIntN(bitwidth) && !pointer.offset.isUnknown())
-            pointer.offset = offset.getZExtValue();
-        else
-            errs() << "WARN: Offset greater than "
-                   << bitwidth << "-bit" << *GEP << "\n";
-    }
-
-    return pointer;
-}
-
-Pointer LLVMPointerSubgraphBuilder::getConstantExprPointer(const llvm::ConstantExpr *CE)
-{
-    using namespace llvm;
-
-    Pointer pointer(UNKNOWN_MEMORY, Offset::UNKNOWN);
-    Instruction *Inst = const_cast<ConstantExpr*>(CE)->getAsInstruction();
-
-    switch(Inst->getOpcode()) {
-        case Instruction::GetElementPtr:
-            pointer = handleConstantGep(cast<GetElementPtrInst>(Inst));
-            break;
-        //case Instruction::ExtractValue:
-        //case Instruction::Select:
-            break;
-        case Instruction::BitCast:
-        case Instruction::SExt:
-        case Instruction::ZExt:
-            pointer = handleConstantBitCast(cast<BitCastInst>(Inst));
-            break;
-        case Instruction::PtrToInt:
-            pointer = handleConstantPtrToInt(cast<PtrToIntInst>(Inst));
-            break;
-        case Instruction::IntToPtr:
-            pointer = handleConstantIntToPtr(cast<IntToPtrInst>(Inst));
-            break;
-        case Instruction::Add:
-            pointer = handleConstantAdd(Inst);
-            break;
-        case Instruction::And:
-        case Instruction::Or:
-        case Instruction::Trunc:
-        case Instruction::Shl:
-        case Instruction::LShr:
-        case Instruction::AShr:
-            pointer = PointerUnknown;
-            break;
-        case Instruction::Sub:
-        case Instruction::Mul:
-        case Instruction::SDiv:
-            pointer = handleConstantArithmetic(Inst);
-            break;
-        default:
-            errs() << "ERR: Unsupported ConstantExpr " << *CE << "\n";
-            abort();
-    }
-
-#if LLVM_VERSION_MAJOR < 5
-    delete Inst;
-#else
-    Inst->deleteValue();
-#endif
-    return pointer;
-}
-
-PSNode *LLVMPointerSubgraphBuilder::createConstantExpr(const llvm::ConstantExpr *CE)
-{
-    Pointer ptr = getConstantExprPointer(CE);
-    PSNode *node = PS.create(PSNodeType::CONSTANT, ptr.target, ptr.offset);
-
-    addNode(CE, node);
-
-    assert(node);
-    return node;
-}
-
-static bool isConstantZero(const llvm::Value *val)
-{
-    using namespace llvm;
-
-    if (const ConstantInt *C = dyn_cast<ConstantInt>(val))
-        return C->isZero();
-
-    return false;
+void dump(const llvm::Value& V) {
+    llvm::errs() << V << "\n";
 }
 
 PSNode *LLVMPointerSubgraphBuilder::getConstant(const llvm::Value *val)
@@ -389,192 +123,38 @@ PSNode *LLVMPointerSubgraphBuilder::tryGetOperand(const llvm::Value *val)
     return op;
 }
 
-PSNode *LLVMPointerSubgraphBuilder::buildNode(const llvm::Value *val)
-{
-    assert(nodes_map.count(val) == 0);
-
-    const llvm::Instruction *Inst
-        = llvm::dyn_cast<llvm::Instruction>(val);
-
-    if (Inst) {
-            PSNodesSeq seq = buildInstruction(*Inst);
-            assert(seq.first && seq.second);
-            return seq.second;
-    } else if (const llvm::Argument *A
-                = llvm::dyn_cast<llvm::Argument>(val)) {
-        return createArgument(A);
-    } else {
-        // this may happen when C code is corrupted like this:
-        // int a, b;
-        // a = &b;
-        // a = 3;
-        //
-        // 'a' is int but is assigned an address of 'b', which leads
-        // to creating an inttoptr/ptrtoint instructions that
-        // have forexample 'i32 3' as operand
-        llvm::errs() << "Invalid value leading to UNKNOWN: " << *val << "\n";
-        return createUnknown(val);
-    }
-}
-
-static bool isRelevantIntrinsic(const llvm::Function *func)
-{
-    using namespace llvm;
-
-    switch (func->getIntrinsicID()) {
-        case Intrinsic::memmove:
-        case Intrinsic::memcpy:
-        case Intrinsic::vastart:
-        case Intrinsic::stacksave:
-        case Intrinsic::stackrestore:
-        case Intrinsic::lifetime_end:
-            return true;
-        // case Intrinsic::memset:
-        default:
-            return false;
-    }
-}
-
-static bool isInvalid(const llvm::Value *val)
-{
-    using namespace llvm;
-
-    if (!isa<Instruction>(val)) {
-        if (!isa<Argument>(val) && !isa<GlobalValue>(val))
-            return true;
-    } else {
-        if (isa<ICmpInst>(val) || isa<FCmpInst>(val)
-            || isa<DbgValueInst>(val) || isa<BranchInst>(val)
-            || isa<SwitchInst>(val))
-            return true;
-
-        const CallInst *CI = dyn_cast<CallInst>(val);
-        if (CI) {
-            const Function *F = CI->getCalledFunction();
-            if (F && F->isIntrinsic() && !isRelevantIntrinsic(F))
-                return true;
-        }
-    }
-
-    return false;
-}
-
 PSNode *LLVMPointerSubgraphBuilder::getOperand(const llvm::Value *val)
 {
     PSNode *op = tryGetOperand(val);
     if (!op) {
         if (isInvalid(val))
             return UNKNOWN_MEMORY;
-        else
-            return buildNode(val);
+
+        llvm::errs() << "ERROR: missing value in graph: " << *val << "\n";
+        abort();
     } else
         return op;
 }
 
-PSNode *LLVMPointerSubgraphBuilder::createDynamicAlloc(const llvm::CallInst *CInst, MemAllocationFuncs type)
-{
-    using namespace llvm;
-
-    const Value *op;
-    uint64_t size = 0, size2 = 0;
-    PSNodeAlloc *node = PSNodeAlloc::get(PS.create(PSNodeType::DYN_ALLOC));
-
-    switch (type) {
-        case MemAllocationFuncs::MALLOC:
-            node->setIsHeap();
-            /* fallthrough */
-        case MemAllocationFuncs::ALLOCA:
-            op = CInst->getOperand(0);
-            break;
-        case MemAllocationFuncs::CALLOC:
-            node->setIsHeap();
-            node->setZeroInitialized();
-            op = CInst->getOperand(1);
-            break;
-        default:
-            errs() << *CInst << "\n";
-            assert(0 && "unknown memory allocation type");
-            // for NDEBUG
-            abort();
-    };
-
-    // infer allocated size
-    size = getConstantSizeValue(op);
-    if (size != 0 && type == MemAllocationFuncs::CALLOC) {
-        // if this is call to calloc, the size is given
-        // in the first argument too
-        size2 = getConstantSizeValue(CInst->getOperand(0));
-        if (size2 != 0)
-            size *= size2;
-    }
-
-    node->setSize(size);
-    return node;
-}
-
 PSNodesSeq
-LLVMPointerSubgraphBuilder::createRealloc(const llvm::CallInst *CInst)
+LLVMPointerSubgraphBuilder::createCallToFunction(const llvm::CallInst *CInst, const llvm::Function *F)
 {
-    using namespace llvm;
-
-    // we create new allocation node and memcpy old pointers there
-    PSNode *orig_mem = getOperand(CInst->getOperand(0));
-    PSNodeAlloc *reall = PSNodeAlloc::get(PS.create(PSNodeType::DYN_ALLOC));
-    // copy everything that is in orig_mem to reall
-    PSNode *mcp = PS.create(PSNodeType::MEMCPY, orig_mem, reall, Offset::UNKNOWN);
-    // we need the pointer in the last node that we return
-    PSNode *ptr = PS.create(PSNodeType::CONSTANT, reall, 0);
-
-    reall->setIsHeap();
-    reall->setSize(getConstantSizeValue(CInst->getOperand(1)));
-
-    reall->addSuccessor(mcp);
-    mcp->addSuccessor(ptr);
-
-    reall->setUserData(const_cast<llvm::CallInst *>(CInst));
-
-    PSNodesSeq ret = PSNodesSeq(reall, ptr);
-    addNode(CInst, ret);
-
-    return ret;
-}
-
-PSNodesSeq
-LLVMPointerSubgraphBuilder::createDynamicMemAlloc(const llvm::CallInst *CInst, MemAllocationFuncs type)
-{
-    assert(type != MemAllocationFuncs::NONEMEM
-            && "BUG: creating dyn. memory node for NONMEM");
-
-    if (type == MemAllocationFuncs::REALLOC) {
-        return createRealloc(CInst);
-    } else {
-        PSNode *node = createDynamicAlloc(CInst, type);
-        addNode(CInst, node);
-
-        // we return (node, node), so that the parent function
-        // will seamlessly connect this node into the graph
-        return std::make_pair(node, node);
-    }
-}
-
-PSNodesSeq
-LLVMPointerSubgraphBuilder::createCallToFunction(const llvm::Function *F)
-{
-    PSNode *callNode, *returnNode;
+    PSNodeCall *callNode;
+    PSNode *returnNode;
 
     // the operands to the return node (which works as a phi node)
     // are going to be added when the subgraph is built
-    callNode = PS.create(PSNodeType::CALL, nullptr);
+    callNode = PSNodeCall::get(PS.create(PSNodeType::CALL));
     returnNode = PS.create(PSNodeType::CALL_RETURN, nullptr);
 
     returnNode->setPairedNode(callNode);
     callNode->setPairedNode(returnNode);
 
     // reuse built subgraphs if available
-    Subgraph& subg = subgraphs_map[F];
-    if (!subg.root) {
-        // create a new subgraph
-        buildFunction(*F);
+    Subgraph& subg = createOrGetSubgraph(F);
+    if (ad_hoc_building) {
+        // add operands to arguments
+        addInterproceduralOperands(F, subg, CInst);
     }
 
     // we took the subg by reference, so it should be filled now
@@ -591,11 +171,6 @@ LLVMPointerSubgraphBuilder::createCallToFunction(const llvm::Function *F)
     // we need to handle the return values even when it is not
     // a pointer as we have ptrtoint and inttoptr
 
-    // create the pointer arguments -- the other arguments will
-    // be created later if needed
-    for (auto A = F->arg_begin(), E = F->arg_end(); A != E; ++A)
-        getOperand(&*A);
-
     return std::make_pair(callNode, returnNode);
 }
 
@@ -604,409 +179,51 @@ LLVMPointerSubgraphBuilder::createFuncptrCall(const llvm::CallInst *CInst,
                                               const llvm::Function *F)
 {
     // set this flag to true, so that createCallToFunction
+    // (and all recursive calls to this function)
     // will also add the program structure instead of only
-    // building the nodes
+    // building the nodes. This is needed as we have the
+    // graph already built and we are now only building
+    // newly created subgraphs ad hoc.
     ad_hoc_building = true;
-    return createOrGetSubgraph(CInst, F);
-}
 
-PSNodesSeq
-LLVMPointerSubgraphBuilder::createOrGetSubgraph(const llvm::CallInst *CInst,
-                                                const llvm::Function *F)
-{
-    PSNodesSeq cf = createCallToFunction(F);
-    addNode(CInst, cf.first);
-
-    if (ad_hoc_building) {
-        Subgraph& subg = subgraphs_map[F];
-        assert(subg.root != nullptr);
-
-        addProgramStructure(F, subg);
-        addInterproceduralOperands(F, subg, CInst);
-    }
-
-    // NOTE: we do not add return node into nodes_map, since this
-    // is artificial node and does not correspond to any real node
-    // FIXME: this breaks that we have a sequence in the graph
-
-    return cf;
-}
-
-PSNodesSeq
-LLVMPointerSubgraphBuilder::createUnknownCall(const llvm::CallInst *CInst)
-{
-    // This assertion must not hold if the call is wrapped
-    // inside bitcast - it defaults to int, but is bitcased
-    // to pointer
-    //assert(CInst->getType()->isPointerTy());
-    PSNode *call = PS.create(PSNodeType::CALL, nullptr);
-
-    call->setPairedNode(call);
-
-    // the only thing that the node will point at
-    call->addPointsTo(PointerUnknown);
-
-    addNode(CInst, call);
-
-    return std::make_pair(call, call);
-}
-
-PSNode *LLVMPointerSubgraphBuilder::createMemTransfer(const llvm::IntrinsicInst *I)
-{
-    using namespace llvm;
-    const Value *dest, *src;//, *lenVal;
-    uint64_t lenVal = Offset::UNKNOWN;
-
-    switch (I->getIntrinsicID()) {
-        case Intrinsic::memmove:
-        case Intrinsic::memcpy:
-            dest = I->getOperand(0);
-            src = I->getOperand(1);
-            lenVal = getConstantValue(I->getOperand(2));
-            break;
-        default:
-            errs() << "ERR: unhandled mem transfer intrinsic" << *I << "\n";
-            abort();
-    }
-
-    PSNode *destNode = getOperand(dest);
-    PSNode *srcNode = getOperand(src);
-    PSNode *node = PS.create(PSNodeType::MEMCPY,
-                              srcNode, destNode, lenVal);
-
-    addNode(I, node);
-    return node;
-}
-
-PSNodesSeq
-LLVMPointerSubgraphBuilder::createVarArg(const llvm::IntrinsicInst *Inst)
-{
-    // just store all the pointers from vararg argument
-    // to the memory given in vastart() on Offset::UNKNOWN.
-    // It is the easiest thing we can do without any further
-    // analysis
-
-    // first we need to get the vararg argument phi
-    const llvm::Function *F = Inst->getParent()->getParent();
+    auto ret = createCallToFunction(CInst, F);
+#ifndef NDEBUG
     Subgraph& subg = subgraphs_map[F];
-    PSNode *arg = subg.vararg;
-    assert(F->isVarArg() && "vastart in a non-variadic function");
-    assert(arg && "Don't have variadic argument in a variadic function");
+    assert(subg.root != nullptr);
+#endif
 
-    // vastart will be node that will keep the memory
-    // with pointers, its argument is the alloca, that
-    // alloca will keep pointer to vastart
-    PSNode *vastart = PS.create(PSNodeType::ALLOC);
-
-    // vastart has only one operand which is the struct
-    // it uses for storing the va arguments. Strip it so that we'll
-    // get the underlying alloca inst
-    PSNode *op = getOperand(Inst->getOperand(0)->stripInBoundsOffsets());
-    // the argument is usually an alloca, but it may be a load
-    // in the case the code was transformed by -reg2mem
-    assert((op->getType() == PSNodeType::ALLOC || op->getType() == PSNodeType::LOAD)
-           && "Argument of vastart is invalid");
-    // get node with the same pointer, but with Offset::UNKNOWN
-    // FIXME: we're leaking it
-    // make the memory in alloca point to our memory in vastart
-    PSNode *ptr = PS.create(PSNodeType::GEP, op, Offset::UNKNOWN);
-    PSNode *S1 = PS.create(PSNodeType::STORE, vastart, ptr);
-    // and also make vastart point to the vararg args
-    PSNode *S2 = PS.create(PSNodeType::STORE, arg, vastart);
-
-    vastart->addSuccessor(ptr);
-    ptr->addSuccessor(S1);
-    S1->addSuccessor(S2);
-
-    // set paired node to S2 for vararg, so that when adding structure,
-    // we add the whole sequence (it adds from call-node to pair-node,
-    // because of the old system where we did not store all sequences)
-    // FIXME: fix this
-    vastart->setPairedNode(S2);
-
-    // FIXME: we're assuming that in a sequence in the nodes_map
-    // is always the last node the 'real' node. In this case it is not true,
-    // so add only the 'vastart', so that we have the mapping in nodes_map
-    addNode(Inst, vastart);
-
-    return PSNodesSeq(vastart, S2);
-}
-
-PSNodesSeq
-LLVMPointerSubgraphBuilder::createIntrinsic(const llvm::Instruction *Inst)
-{
-    using namespace llvm;
-    PSNode *n;
-
-    const IntrinsicInst *I = cast<IntrinsicInst>(Inst);
-    if (isa<MemTransferInst>(I)) {
-        n = createMemTransfer(I);
-        return std::make_pair(n, n);
-    } else if (isa<MemSetInst>(I)) {
-        return createMemSet(I);
-    }
-
-    switch (I->getIntrinsicID()) {
-        case Intrinsic::vastart:
-            return createVarArg(I);
-        case Intrinsic::stacksave:
-            errs() << "WARNING: Saving stack may yield unsound results!: "
-                   << *Inst << "\n";
-            n = createAlloc(Inst);
-            return std::make_pair(n, n);
-        case Intrinsic::stackrestore:
-            n = createLoad(Inst);
-            return std::make_pair(n, n);
-        default:
-            errs() << *Inst << "\n";
-            errs() << "Unhandled intrinsic ^^\n";
-            abort();
-    }
-}
-
-PSNode *
-LLVMPointerSubgraphBuilder::createAsm(const llvm::Instruction *Inst)
-{
-    // we filter irrelevant calls in isRelevantCall()
-    // and we don't have assembler there at all. If
-    // we are here, then we got here because this
-    // is undefined call that returns pointer.
-    // In this case return an unknown pointer
-    static bool warned = false;
-    if (!warned) {
-        llvm::errs() << "PTA: Inline assembly found, analysis  may be unsound\n";
-        warned = true;
-    }
-
-    PSNode *n = PS.create(PSNodeType::CONSTANT, UNKNOWN_MEMORY, Offset::UNKNOWN);
-    // it is call that returns pointer, so we'd like to have
-    // a 'return' node that contains that pointer
-    n->setPairedNode(n);
-    addNode(Inst, n);
-
-    return n;
-}
-
-PSNode * LLVMPointerSubgraphBuilder::createLifetimeEnd(const llvm::Instruction *Inst)
-{
-    PSNode *op1 = getOperand(Inst->getOperand(1));
-    PSNode *node = PS.create(PSNodeType::INVALIDATE_OBJECT, op1);
-
-    addNode(Inst, node);
-
-    assert(node);
-    return node;
-}
-
-PSNode * LLVMPointerSubgraphBuilder::createFree(const llvm::Instruction *Inst)
-{
-    PSNode *op1 = getOperand(Inst->getOperand(0));
-    PSNode *node = PS.create(PSNodeType::FREE, op1);
-
-    addNode(Inst, node);
-
-    assert(node);
-    return node;
-}
-
-// create subgraph or add edges to already existing subgraph,
-// return the CALL node (the first) and the RETURN node (the second),
-// so that we can connect them into the PointerSubgraph
-PSNodesSeq
-LLVMPointerSubgraphBuilder::createCall(const llvm::Instruction *Inst)
-{
-    using namespace llvm;
-    const CallInst *CInst = cast<CallInst>(Inst);
-    const Value *calledVal = CInst->getCalledValue()->stripPointerCasts();
-
-    if (CInst->isInlineAsm()) {
-        PSNode *n = createAsm(Inst);
-        return std::make_pair(n, n);
-    }
-    const IntrinsicInst *IInst = dyn_cast<IntrinsicInst>(Inst);
-    if (IInst && IInst->getIntrinsicID() == Intrinsic::lifetime_end) {
-
-        PSNode *n = createLifetimeEnd(Inst);
-        return std::make_pair(n, n);
-    }
-
-    const Function *func = dyn_cast<Function>(calledVal);
-    if (func) {
-        // is it a call to free? If so, create invalidate node
-        // instead.
-        if(invalidate_nodes && func->getName().equals("free")) {
-            PSNode *n = createFree(Inst);
-            return std::make_pair(n, n);
-        }
-
-        // is function undefined? If so it can be
-        // intrinsic, memory allocation (malloc, calloc,...)
-        // or just undefined function
-        // NOTE: we first need to check whether the function
-        // is undefined and after that if it is memory allocation,
-        // because some programs may define function named
-        // 'malloc' etc.
-        if (func->size() == 0) {
-            /// memory allocation (malloc, calloc, etc.)
-            MemAllocationFuncs type = getMemAllocationFunc(func);
-            if (type != MemAllocationFuncs::NONEMEM) {
-                return createDynamicMemAlloc(CInst, type);
-            } else if (func->isIntrinsic()) {
-                return createIntrinsic(Inst);
-            } else
-                return createUnknownCall(CInst);
-        } else {
-            return createOrGetSubgraph(CInst, func);
-        }
-    } else {
-        // function pointer call
-        PSNode *op = getOperand(calledVal);
-        PSNode *call_funcptr = PS.create(PSNodeType::CALL_FUNCPTR, op);
-        PSNode *ret_call = PS.create(PSNodeType::CALL_RETURN, nullptr);
-
-        ret_call->setPairedNode(call_funcptr);
-        call_funcptr->setPairedNode(ret_call);
-
-        call_funcptr->addSuccessor(ret_call);
-        addNode(CInst, call_funcptr);
-
-        return std::make_pair(call_funcptr, ret_call);
-    }
-}
-
-PSNode *LLVMPointerSubgraphBuilder::createAlloc(const llvm::Instruction *Inst)
-{
-    PSNodeAlloc *node = PSNodeAlloc::get(PS.create(PSNodeType::ALLOC));
-    addNode(Inst, node);
-
-    const llvm::AllocaInst *AI = llvm::dyn_cast<llvm::AllocaInst>(Inst);
-    if (AI)
-        node->setSize(getAllocatedSize(AI, DL));
-
-    return node;
-}
-
-PSNode *LLVMPointerSubgraphBuilder::createStore(const llvm::Instruction *Inst)
-{
-    const llvm::Value *valOp = Inst->getOperand(0);
-
-    PSNode *op1 = getOperand(valOp);
-    PSNode *op2 = getOperand(Inst->getOperand(1));
-
-    PSNode *node = PS.create(PSNodeType::STORE, op1, op2);
-    addNode(Inst, node);
-
-    assert(node);
-    return node;
-}
-
-PSNode *LLVMPointerSubgraphBuilder::createLoad(const llvm::Instruction *Inst)
-{
-    const llvm::Value *op = Inst->getOperand(0);
-
-    PSNode *op1 = getOperand(op);
-    PSNode *node = PS.create(PSNodeType::LOAD, op1);
-
-    addNode(Inst, node);
-
-    assert(node);
-    return node;
-}
-
-PSNode *LLVMPointerSubgraphBuilder::createGEP(const llvm::Instruction *Inst)
-{
-    using namespace llvm;
-
-    const GetElementPtrInst *GEP = cast<GetElementPtrInst>(Inst);
-    const Value *ptrOp = GEP->getPointerOperand();
-    unsigned bitwidth = getPointerBitwidth(DL, ptrOp);
-    APInt offset(bitwidth, 0);
-
-    PSNode *node = nullptr;
-    PSNode *op = getOperand(ptrOp);
-
-    if (field_sensitivity > 0
-        && GEP->accumulateConstantOffset(*DL, offset)) {
-        // is offset in given bitwidth?
-        if (offset.isIntN(bitwidth)) {
-            // is 0 < offset < field_sensitivity ?
-            uint64_t off = offset.getLimitedValue(field_sensitivity);
-            if (off == 0 || off < field_sensitivity)
-                node = PS.create(PSNodeType::GEP, op, offset.getZExtValue());
-        } else
-            errs() << "WARN: GEP offset greater than " << bitwidth << "-bit";
-            // fall-through to Offset::UNKNOWN in this case
-    }
-
-    // we didn't create the node with concrete offset,
-    // in which case we are supposed to create a node
-    // with Offset::UNKNOWN
-    if (!node)
-        node = PS.create(PSNodeType::GEP, op, Offset::UNKNOWN);
-
-    addNode(Inst, node);
-
-    assert(node);
-    return node;
-}
-
-PSNode *LLVMPointerSubgraphBuilder::createSelect(const llvm::Instruction *Inst)
-{
-    // with ptrtoint/inttoptr it may not be a pointer
-    // assert(Inst->getType()->isPointerTy() && "BUG: This select is not a pointer");
-
-    // select <cond> <op1> <op2>
-    PSNode *op1 = getOperand(Inst->getOperand(1));
-    PSNode *op2 = getOperand(Inst->getOperand(2));
-
-    // select works as a PHI in points-to analysis
-    PSNode *node = PS.create(PSNodeType::PHI, op1, op2, nullptr);
-    addNode(Inst, node);
-
-    assert(node);
-    return node;
-}
-
-PSNodesSeq
-LLVMPointerSubgraphBuilder::createExtract(const llvm::Instruction *Inst)
-{
-    using namespace llvm;
-
-    const ExtractValueInst *EI = cast<ExtractValueInst>(Inst);
-
-    // extract <agg> <idx> {<idx>, ...}
-    PSNode *op1 = getOperand(EI->getAggregateOperand());
-    // FIXME: get the correct offset
-    PSNode *G = PS.create(PSNodeType::GEP, op1, Offset::UNKNOWN);
-    PSNode *L = PS.create(PSNodeType::LOAD, G);
-
-    G->addSuccessor(L);
-
-    PSNodesSeq ret = PSNodesSeq(G, L);
-    addNode(Inst, ret);
+    ad_hoc_building = false;
 
     return ret;
 }
 
-PSNode *LLVMPointerSubgraphBuilder::createPHI(const llvm::Instruction *Inst)
+LLVMPointerSubgraphBuilder::Subgraph&
+LLVMPointerSubgraphBuilder::createOrGetSubgraph(const llvm::Function *F)
 {
-    PSNode *node = PS.create(PSNodeType::PHI, nullptr);
-    addNode(Inst, node);
+    auto it = subgraphs_map.find(F);
+    if (it == subgraphs_map.end()) {
+        // create a new subgraph
+        Subgraph& subg = buildFunction(*F);
+        assert(subg.root != nullptr);
 
-    // NOTE: we didn't add operands to PHI node here, but after building
-    // the whole function, because some blocks may not have been built
-    // when we were creating the phi node
+        if (ad_hoc_building) {
+            addProgramStructure(F, subg);
+        }
 
-    assert(node);
-    return node;
+        return subg;
+    }
+
+    return it->second;
 }
 
 void LLVMPointerSubgraphBuilder::addPHIOperands(PSNode *node, const llvm::PHINode *PHI)
 {
     for (int i = 0, e = PHI->getNumIncomingValues(); i < e; ++i) {
-        PSNode *op = tryGetOperand(PHI->getIncomingValue(i));
-        if (op)
-            node->addOperand(op);
+        if (PSNode *op = tryGetOperand(PHI->getIncomingValue(i))) {
+            // do not add duplicate operands
+            if (!node->hasOperand(op))
+                node->addOperand(op);
+        }
     }
 }
 
@@ -1014,270 +231,10 @@ void LLVMPointerSubgraphBuilder::addPHIOperands(const llvm::Function &F)
 {
     for (const llvm::BasicBlock& B : F) {
         for (const llvm::Instruction& I : B) {
-            const llvm::PHINode *PHI = llvm::dyn_cast<llvm::PHINode>(&I);
-            if (PHI) {
+            if (const llvm::PHINode *PHI = llvm::dyn_cast<llvm::PHINode>(&I)) {
                 if (PSNode *node = getNode(PHI))
                     addPHIOperands(node, PHI);
             }
-        }
-    }
-}
-
-PSNode *LLVMPointerSubgraphBuilder::createCast(const llvm::Instruction *Inst)
-{
-    const llvm::Value *op = Inst->getOperand(0);
-    PSNode *op1 = getOperand(op);
-    PSNode *node = PS.create(PSNodeType::CAST, op1);
-
-    addNode(Inst, node);
-
-    assert(node);
-    return node;
-}
-
-// sometimes inttoptr is masked using & or | operators,
-// so we need to support that. Anyway, that changes the pointer
-// completely, so we just return unknown pointer
-PSNode *LLVMPointerSubgraphBuilder::createUnknown(const llvm::Value *val)
-{
-    // nothing better we can do, these operations
-    // completely change the value of pointer...
-
-    // FIXME: or there's enough unknown offset? Check it out!
-    PSNode *node = PS.create(PSNodeType::CONSTANT, UNKNOWN_MEMORY, Offset::UNKNOWN);
-
-    addNode(val, node);
-
-    assert(node);
-    return node;
-}
-
-// ptrToInt work just as a bitcast
-PSNode *LLVMPointerSubgraphBuilder::createPtrToInt(const llvm::Instruction *Inst)
-{
-    const llvm::Value *op = Inst->getOperand(0);
-
-    PSNode *op1 = getOperand(op);
-    // NOTE: we don't support arithmetic operations, so instead of
-    // just casting the value do gep with unknown offset -
-    // this way we cover any shift of the pointer due to arithmetic
-    // operations
-    // PSNode *node = PS.create(PSNodeType::CAST, op1);
-    PSNode *node = PS.create(PSNodeType::GEP, op1, 0);
-    addNode(Inst, node);
-
-    // here we lost the type information,
-    // so we must build all possible nodes that may affect
-    // the pointer analysis
-    transitivelyBuildUses(Inst);
-    transitivelyBuildUses(Inst->getOperand(0));
-
-    assert(node);
-    return node;
-}
-
-PSNode *LLVMPointerSubgraphBuilder::createIntToPtr(const llvm::Instruction *Inst)
-{
-    const llvm::Value *op = Inst->getOperand(0);
-    PSNode *op1;
-
-    if (llvm::isa<llvm::Constant>(op)) {
-        llvm::errs() << "PTA warning: IntToPtr with constant: "
-                     << *Inst << "\n";
-        // if this is inttoptr with constant, just make the pointer
-        // unknown
-        op1 = UNKNOWN_MEMORY;
-    } else
-        op1 = getOperand(op);
-
-    PSNode *node = PS.create(PSNodeType::CAST, op1);
-    addNode(Inst, node);
-
-    // here we lost the type information,
-    // so we must build all possible nodes that may affect
-    // the pointer analysis
-    transitivelyBuildUses(Inst);
-    transitivelyBuildUses(Inst->getOperand(0));
-
-    assert(node);
-    return node;
-}
-
-PSNode *LLVMPointerSubgraphBuilder::createAdd(const llvm::Instruction *Inst)
-{
-    using namespace llvm;
-
-    PSNode *node;
-    PSNode *op;
-    const Value *val = nullptr;
-    uint64_t off = Offset::UNKNOWN;
-
-    if (isa<ConstantInt>(Inst->getOperand(0))) {
-        op = getOperand(Inst->getOperand(1));
-        val = Inst->getOperand(0);
-    } else if (isa<ConstantInt>(Inst->getOperand(1))) {
-        op = getOperand(Inst->getOperand(0));
-        val = Inst->getOperand(1);
-    } else {
-        // the operands are both non-constant. Check if we
-        // can get an operand as one of them and if not,
-        // fall-back to unknown memory, because we
-        // would need to track down both operads...
-        op = tryGetOperand(Inst->getOperand(0));
-        if (!op)
-            op = tryGetOperand(Inst->getOperand(1));
-
-        if (!op)
-            return createUnknown(Inst);
-    }
-
-    assert(op && "Don't have operand for add");
-    if (val)
-        off = getConstantValue(val);
-
-    node = PS.create(PSNodeType::GEP, op, off);
-    addNode(Inst, node);
-
-    assert(node);
-    return node;
-}
-
-PSNode *LLVMPointerSubgraphBuilder::createArithmetic(const llvm::Instruction *Inst)
-{
-    using namespace llvm;
-
-    PSNode *node;
-    PSNode *op;
-
-    // we don't know if the operand is the first or
-    // the other operand
-    if (isa<ConstantInt>(Inst->getOperand(0))) {
-        op = getOperand(Inst->getOperand(1));
-    } else if (isa<ConstantInt>(Inst->getOperand(0))) {
-        op = getOperand(Inst->getOperand(0));
-    } else {
-        // the operands are both non-constant. Check if we
-        // can get an operand as one of them and if not,
-        // fall-back to unknown memory, because we
-        // would need to track down both operads...
-        op = tryGetOperand(Inst->getOperand(0));
-        if (!op)
-            op = tryGetOperand(Inst->getOperand(1));
-
-        if (!op)
-            return createUnknown(Inst);
-    }
-
-    // we don't know what the operation does,
-    // so set unknown offset
-    node = PS.create(PSNodeType::GEP, op, Offset::UNKNOWN);
-    addNode(Inst, node);
-
-    assert(node);
-    return node;
-}
-
-PSNode *LLVMPointerSubgraphBuilder::createReturn(const llvm::Instruction *Inst)
-{
-    PSNode *op1 = nullptr;
-    // is nullptr if this is 'ret void'
-    llvm::Value *retVal = llvm::cast<llvm::ReturnInst>(Inst)->getReturnValue();
-
-    // we create even void and non-pointer return nodes,
-    // since these modify CFG (they won't bear any
-    // points-to information though)
-    // XXX is that needed?
-
-    // DONT: if(retVal->getType()->isPointerTy())
-    // we have ptrtoint which break the types...
-    if (retVal) {
-        if (llvm::isa<llvm::ConstantPointerNull>(retVal)
-            || isConstantZero(retVal))
-            op1 = NULLPTR;
-        else if (typeCanBePointer(retVal->getType()) &&
-                  (!isInvalid(retVal->stripPointerCasts()) ||
-                   llvm::isa<llvm::ConstantExpr>(retVal)))
-            op1 = getOperand(retVal);
-    }
-
-    assert((op1 || !retVal || !retVal->getType()->isPointerTy())
-           && "Don't have operand for ReturnInst with pointer");
-
-    PSNode *node = PS.create(PSNodeType::RETURN, op1, nullptr);
-    addNode(Inst, node);
-
-    return node;
-}
-
-void LLVMPointerSubgraphBuilder::transitivelyBuildUses(const llvm::Value *val)
-{
-    using namespace llvm;
-
-    assert(!isa<ConstantInt>(val) && "Tried building uses of constant int");
-
-    for (auto I = val->use_begin(), E = val->use_end(); I != E; ++I) {
-#if ((LLVM_VERSION_MAJOR == 3) && (LLVM_VERSION_MINOR < 5))
-        const llvm::Value *use = *I;
-#else
-        const llvm::Value *use = I->getUser();
-#endif
-
-        if (isInvalid(use))
-            continue;
-
-        if (nodes_map.count(use) == 0) {
-            PSNode *nd = buildNode(use);
-            // we reached some point where we do not know
-            // how to continue (the ptrtoint use-chains probably
-            // got somewhere where we do not know how to handle
-            // the instructions)
-            if (nd == UNKNOWN_MEMORY)
-                continue;
-
-            if (const StoreInst *SI = dyn_cast<StoreInst>(use)) {
-                // build the value, but only if it is a valid thing
-                // - for example, we do not want to build constants
-                if (!isInvalid(SI->getOperand(0)))
-                    transitivelyBuildUses(SI->getOperand(0));
-                // for StoreInst we need to get even uses
-                // of the pointer, since we stored the value
-                // into it (we want to have the loads from it)
-                transitivelyBuildUses(SI->getOperand(1));
-            } else if (const LoadInst *LI = dyn_cast<LoadInst>(use)) {
-                transitivelyBuildUses(LI->getOperand(0));
-            } else if (const CallInst *CI = dyn_cast<CallInst>(use)) {
-                const Function *F = CI->getCalledFunction();
-                if (F) {
-                    // if this function is not built, build it
-                    if (!F->empty()) {
-                        Subgraph& subg = subgraphs_map[F];
-                        if (!subg.root)
-                            buildFunction(*F);
-                        assert(subg.root && "Did not build the function");
-                    }
-
-                    // get the index of the use as an argument
-                    int idx = 0;
-                    for (int e = CI->getNumArgOperands(); idx < e; ++idx)
-                        if (val == CI->getArgOperand(idx))
-                            break;
-
-                    // find the argument at the index
-                    for (auto A = F->arg_begin(), E = F->arg_end(); A != E; ++A, --idx) {
-                        if (idx == 0) {
-                            // if we have not built this argument yet,
-                            // build it!
-                            if (nodes_map.count(&*A) == 0) {
-                                PSNode *nd = buildNode(&*A);
-                                if (nd != UNKNOWN_MEMORY)
-                                    transitivelyBuildUses(&*A);
-                            }
-                        }
-                    }
-                }
-            }
-
-            transitivelyBuildUses(use);
         }
     }
 }
@@ -1310,21 +267,8 @@ static bool isRelevantCall(const llvm::Instruction *Inst)
         if (func->isIntrinsic())
             return isRelevantIntrinsic(func);
 
-        // returns pointer? We want that too - this is gonna be
-        // an unknown pointer
-        if (Inst->getType()->isPointerTy())
-            return true;
-
-        // XXX: what if undefined function takes as argument pointer
-        // to memory with pointers? In that case to be really sound
-        // we should make those pointers unknown. Another case is
-        // what if the function returns a structure (is it possible in LLVM?)
-        // It can return a structure containing a pointer - thus we should
-        // make this pointer unknown
-
-        // here we have: undefined function not returning a pointer
-        // and not memory allocation: we don't need that
-        return false;
+        // it returns something? We want that!
+        return !func->getReturnType()->isVoidTy();
     } else
         // we want defined function, since those can contain
         // pointer's manipulation and modify CFG
@@ -1393,6 +337,7 @@ LLVMPointerSubgraphBuilder::buildInstruction(const llvm::Instruction& Inst)
         case Instruction::SRem:
         case Instruction::FRem:
         case Instruction::FPTrunc:
+        case Instruction::FPExt:
             // these instructions reinterpert the pointer,
             // nothing better we can do here (I think?)
             node = createUnknown(&Inst);
@@ -1410,7 +355,7 @@ LLVMPointerSubgraphBuilder::buildInstruction(const llvm::Instruction& Inst)
             break;
         case Instruction::FPToUI:
         case Instruction::FPToSI:
-            if (typeCanBePointer(Inst.getType()))
+            if (typeCanBePointer(DL, Inst.getType()))
                 node = createCast(&Inst);
             else
                 node = createUnknown(&Inst);
@@ -1430,65 +375,16 @@ bool LLVMPointerSubgraphBuilder::isRelevantInstruction(const llvm::Instruction& 
     using namespace llvm;
 
     switch(Inst.getOpcode()) {
-        case Instruction::Store:
-            // create only nodes that store pointer to another
-            // pointer. We don't care about stores of non-pointers.
-            // The only exception are stores to inttoptr nodes
-            if (Inst.getOperand(0)->getType()->isPointerTy()
-                // this will probably create the operand if we do not
-                // have it, but we would create it later anyway
-                || (tryGetOperand(Inst.getOperand(0)) != UNKNOWN_MEMORY))
-                return true;
-            else
-                return false;
-        case Instruction::ExtractValue:
-            return Inst.getType()->isPointerTy();
-        case Instruction::Load:
-            // LLVM does optimizations like that this code
-            // (it basically does ptrtoint using bitcast)
-            //
-            // %2 = GEP %a, 0, 0
-            //
-            // gets transformed to
-            //
-            // %1 = bitcast %a to *i32
-            // %2 = load i32, i32* %1
-            //
-            // because that probably may be faster on 32-bit machines.
-            // That completely breaks our relevancy criterions,
-            // so we must use this hack (the same with store)
-            if (tryGetOperand(Inst.getOperand(0)) != UNKNOWN_MEMORY)
-                return true;
-            /* fallthrough */
-        case Instruction::Select:
-        case Instruction::PHI:
-            // here we don't care about intToPtr, because every such
-            // value must be bitcasted first, and thus is a pointer
-            if (Inst.getType()->isPointerTy())
-                return true;
-            else
-                return false;
-        case Instruction::Call:
-            if (isRelevantCall(&Inst))
-                return true;
-            else
-                return false;
-        case Instruction::Alloca:
-        case Instruction::GetElementPtr:
-        case Instruction::BitCast:
-        case Instruction::PtrToInt:
-        case Instruction::IntToPtr:
-        // we need to create every ret inst, because
-        // it changes the flow of information
-        case Instruction::Ret:
-            return true;
-        default:
-            if (Inst.getType()->isPointerTy()) {
-                llvm::errs() << "Unhandled relevant inst: " << Inst << "\n";
-                abort();
-            }
-
+        case Instruction::ICmp:
+        case Instruction::FCmp:
+        case Instruction::Br:
+        case Instruction::Switch:
+        case Instruction::Unreachable:
             return false;
+        case Instruction::Call:
+            return isRelevantCall(&Inst);
+        default:
+            return true;
     }
 
     assert(0 && "Not to be reached");
@@ -1503,50 +399,6 @@ PSNode *LLVMPointerSubgraphBuilder::createArgument(const llvm::Argument *farg)
     addNode(farg, arg);
 
     return arg;
-}
-
-static bool memsetIsZeroInitialization(const llvm::IntrinsicInst *I)
-{
-    return isConstantZero(I->getOperand(1));
-}
-
-// recursively find out if type contains a pointer type as a subtype
-// (or if it is a pointer type itself)
-static bool tyContainsPointer(const llvm::Type *Ty)
-{
-    if (Ty->isAggregateType()) {
-        for (auto I = Ty->subtype_begin(), E = Ty->subtype_end();
-             I != E; ++I) {
-            if (tyContainsPointer(*I))
-                return true;
-        }
-    } else
-        return Ty->isPointerTy();
-
-    return false;
-}
-
-PSNodesSeq
-LLVMPointerSubgraphBuilder::createMemSet(const llvm::Instruction *Inst)
-{
-    PSNode *val;
-    if (memsetIsZeroInitialization(llvm::cast<llvm::IntrinsicInst>(Inst)))
-        val = NULLPTR;
-    else
-        // if the memset is not 0-initialized, it does some
-        // garbage into the pointer
-        val = UNKNOWN_MEMORY;
-
-    PSNode *op = getOperand(Inst->getOperand(0)->stripInBoundsOffsets());
-    // we need to make unknown offsets
-    PSNode *G = PS.create(PSNodeType::GEP, op, Offset::UNKNOWN);
-    PSNode *S = PS.create(PSNodeType::STORE, val, G);
-    G->addSuccessor(S);
-
-    PSNodesSeq ret = PSNodesSeq(G, S);
-    addNode(Inst, ret);
-
-    return ret;
 }
 
 void LLVMPointerSubgraphBuilder::checkMemSet(const llvm::Instruction *Inst)
@@ -1595,9 +447,7 @@ void LLVMPointerSubgraphBuilder::buildPointerSubgraphBlock(const llvm::BasicBloc
             continue;
         }
 
-        // maybe this instruction was already created by getOperand()
-        if (nodes_map.count(&Inst) != 0)
-            continue;
+        assert(nodes_map.count(&Inst) == 0);
 
 #ifndef NDEBUG
         PSNodesSeq seq =
@@ -1609,10 +459,53 @@ void LLVMPointerSubgraphBuilder::buildPointerSubgraphBlock(const llvm::BasicBloc
     }
 }
 
-// build pointer state subgraph for given graph
-// \return   root node of the graph
-PSNode *LLVMPointerSubgraphBuilder::buildFunction(const llvm::Function& F)
+// Get llvm BasicBlock's in levels of Dominator Tree (BFS order through the dominator tree)
+std::vector<const llvm::BasicBlock *> getBasicBlocksInDominatorOrder(llvm::Function& F)
 {
+    std::vector<const llvm::BasicBlock *> blocks;
+    blocks.reserve(F.size());
+
+#if ((LLVM_VERSION_MAJOR == 3) && (LLVM_VERSION_MINOR < 9))
+        llvm::DominatorTree DTree;
+        DTree.recalculate(F);
+#else
+        llvm::DominatorTreeWrapperPass wrapper;
+        wrapper.runOnFunction(F);
+        auto& DTree = wrapper.getDomTree();
+#ifndef NDEBUG
+        wrapper.verifyAnalysis();
+#endif
+#endif
+
+    auto root_node = DTree.getRootNode();
+    blocks.push_back(root_node->getBlock());
+
+    std::vector<llvm::DomTreeNode *> to_process;
+    to_process.reserve(4);
+    to_process.push_back(root_node);
+
+    while (!to_process.empty()) {
+        std::vector<llvm::DomTreeNode *> new_to_process;
+        new_to_process.reserve(to_process.size());
+
+        for (auto cur_node : to_process) {
+            for (auto child : *cur_node) {
+                new_to_process.push_back(child);
+                blocks.push_back(child->getBlock());
+            }
+        }
+
+        to_process.swap(new_to_process);
+    }
+
+    return blocks;
+}
+
+LLVMPointerSubgraphBuilder::Subgraph&
+LLVMPointerSubgraphBuilder::buildFunction(const llvm::Function& F)
+{
+    assert(subgraphs_map.count(&F) == 0 && "We already built this function");
+
     // create root and (unified) return nodes of this subgraph. These are
     // just for our convenience when building the graph, they can be
     // optimized away later since they are noops
@@ -1634,20 +527,40 @@ PSNode *LLVMPointerSubgraphBuilder::buildFunction(const llvm::Function& F)
     if (F.isVarArg())
         vararg = PS.create(PSNodeType::PHI, nullptr);
 
+    // create the pointer arguments -- the other arguments will
+    // be created later if needed
+    for (auto A = F.arg_begin(), E = F.arg_end(); A != E; ++A) {
+#ifndef NDEBUG
+        PSNode *a = tryGetOperand(&*A);
+        assert(a == nullptr || a == UNKNOWN_MEMORY);
+#endif
+        createArgument(&*A);
+    }
+
     // add record to built graphs here, so that subsequent call of this function
     // from buildPointerSubgraphBlock won't get stuck in infinite recursive call when
     // this function is recursive
-    subgraphs_map[&F] = Subgraph(root, ret, vararg);
+    Subgraph subg(root, ret, vararg);
+    auto it = subgraphs_map.emplace(&F, std::move(subg));
+    assert(it.second == true && "Already had this element");
+
+    Subgraph& s = it.first->second;
+    assert(s.root == root && s.ret == ret && s.vararg == vararg);
+
+    s.llvmBlocks =
+        getBasicBlocksInDominatorOrder(const_cast<llvm::Function&>(F));
 
     // build the instructions from blocks
-    for (const llvm::BasicBlock& block : F)
-        buildPointerSubgraphBlock(block);
+    for (const llvm::BasicBlock *block : s.llvmBlocks) {
+        buildPointerSubgraphBlock(*block);
+    }
 
     // add operands to PHI nodes. It must be done after all blocks are
     // built, since the PHI gathers values from different blocks
     addPHIOperands(F);
 
-    return root;
+    assert(subgraphs_map[&F].root != nullptr);
+    return s;
 }
 
 void LLVMPointerSubgraphBuilder::addProgramStructure()
@@ -1660,10 +573,24 @@ void LLVMPointerSubgraphBuilder::addProgramStructure()
         // add the CFG edges
         addProgramStructure(F, subg);
 
-        std::set<PSNode *> cont;
-        getNodes(cont, subg.root, subg.ret, 0xdead);
-        for (PSNode* n : cont) {
-            n->setParent(subg.root);
+        // if the return node has no predecessors,
+        // then this function does not return.
+        // Remove the return node.
+        if (subg.ret->predecessorsNum() == 0) {
+            subg.ret->isolate();
+            PS.remove(subg.ret);
+            subg.ret = nullptr;
+
+            // remove also the CALL_RETURN node as it is
+            // useles now
+            for (PSNode *call : subg.root->getPredecessors()) {
+                assert(call->getType() == PSNodeType::CALL ||
+                       call->getType() == PSNodeType::CALL_FUNCPTR);
+                PSNode *call_ret = call->getPairedNode();
+                call->setPairedNode(nullptr);
+                call_ret->isolate();
+                PS.remove(call_ret);
+            }
         }
 
         // add the missing operands (to arguments and return nodes)
@@ -1676,8 +603,12 @@ void LLVMPointerSubgraphBuilder::addArgumentOperands(const llvm::CallInst *CI,
 {
     assert(idx < static_cast<int>(CI->getNumArgOperands()));
     PSNode *op = tryGetOperand(CI->getArgOperand(idx));
-    if (op)
+    if (op && !arg->hasOperand(op)) {
+        // NOTE: do not add an operand multiple-times
+        // (when a function is called multiple-times with
+        // the same actual parameters)
         arg->addOperand(op);
+    }
 }
 
 void LLVMPointerSubgraphBuilder::addArgumentOperands(const llvm::Function *F,
@@ -1703,8 +634,7 @@ void LLVMPointerSubgraphBuilder::addArgumentsOperands(const llvm::Function *F,
     int idx = 0;
     for (auto A = F->arg_begin(), E = F->arg_end(); A != E; ++A, ++idx) {
         auto it = nodes_map.find(&*A);
-        if (it == nodes_map.end())
-            continue;
+        assert(it != nodes_map.end());
 
         PSNodesSeq& cur = it->second;
         assert(cur.first == cur.second);
@@ -1779,7 +709,8 @@ void LLVMPointerSubgraphBuilder::addReturnNodeOperand(const llvm::CallInst *CI, 
     // so there must be associated the return node
     assert(returnNode);
 
-    returnNode->addOperand(op);
+    if (!returnNode->hasOperand(op))
+        returnNode->addOperand(op);
 }
 
 
@@ -1816,7 +747,9 @@ void LLVMPointerSubgraphBuilder::addInterproceduralOperands(const llvm::Function
             addVariadicArgumentOperands(F, subg.vararg);
     }
 
-    addReturnNodeOperands(F, subg.ret, CI);
+    if (subg.ret) {
+        addReturnNodeOperands(F, subg.ret, CI);
+    }
 }
 
 
@@ -1838,7 +771,9 @@ PointerSubgraph *LLVMPointerSubgraphBuilder::buildLLVMPointerSubgraph(llvm::Func
     PSNodesSeq glob = buildGlobals();
 
     // now we can build rest of the graph
-    PSNode *root = buildFunction(*entry);
+    Subgraph& subg = buildFunction(*entry);
+    PSNode *root = subg.root;
+    assert(root != nullptr);
 
     // fill in the CFG edges
     addProgramStructure();
@@ -1858,13 +793,19 @@ PointerSubgraph *LLVMPointerSubgraphBuilder::buildLLVMPointerSubgraph(llvm::Func
 
     PS.setRoot(root);
 
+#ifndef NDEBUG
     debug::LLVMPointerSubgraphValidator validator(&PS);
     if (validator.validate()) {
-        llvm::errs() << "Pointer Subgraph is broken!\n";
+        llvm::errs() << validator.getWarnings();
+
+        llvm::errs() << "Pointer Subgraph is broken (right after building)!\n";
         assert(!validator.getErrors().empty());
         llvm::errs() << validator.getErrors();
-        //return nullptr;
+        return nullptr;
+    } else {
+        llvm::errs() << validator.getWarnings();
     }
+#endif // NDEBUG
 
     return &PS;
 }

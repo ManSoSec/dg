@@ -64,8 +64,7 @@ public:
         dont_touch.insert(n);
     }
 
-    /* virtual */
-    bool removeNode(LLVMNode *node)
+    bool removeNode(LLVMNode *node) override
     {
         using namespace llvm;
 
@@ -86,14 +85,13 @@ public:
         return true;
     }
 
-    /* virtual */
-    void removeBlock(LLVMBBlock *block)
+    bool removeBlock(LLVMBBlock *block) override
     {
         assert(block);
 
         llvm::Value *val = block->getKey();
         if (val == nullptr)
-            return;
+            return true;
 
         llvm::BasicBlock *blk = llvm::cast<llvm::BasicBlock>(val);
         for (auto& succ : block->successors()) {
@@ -105,8 +103,7 @@ public:
             if (succ.target == block)
                 continue;
 
-            llvm::Value *sval = succ.target->getKey();
-            if (sval)
+            if (llvm::Value *sval = succ.target->getKey())
                 adjustPhiNodes(llvm::cast<llvm::BasicBlock>(sval), blk);
         }
 
@@ -123,6 +120,7 @@ public:
 
         // finally, erase the block per se
         blk->eraseFromParent();
+        return true;
     }
 
     // override slice method
@@ -396,29 +394,29 @@ private:
 
                 BB->removeSuccessors();
                 BB->addSuccessor(succ, 0);
-#ifdef ENABLE_DEBUG
+#ifdef NDEBUG
                 assert(BB->successorsNum() == 1
                        && "BUG: in removeSuccessors() or addSuccessor()");
 #endif
             }
 
-#ifdef ENABLE_DEBUG
+#ifndef NDEBUG
             // check the BB
-            std::set<int> labels;
+            labels.clear();
             for (const auto& succ : BB->successors()) {
-                assert(!newExitBB || succ.target != oldExitBB
+                assert((!newExitBB || succ.target != oldExitBB)
                         && "A block has the old BB as successor");
                 // we can have more labels with different targets,
                 // but we can not have one target with more labels
-                assert(labels.insert(succ.label).second
-                        && "Already have a label");
+                assert(labels.insert(succ.label) && "Already have a label");
             }
 
             // check that we have all labels without any gep
             auto l = labels.begin();
-            for (int i = 0; i < labels.size(); ++i) {
+            for (unsigned i = 0; i < labels.size(); ++i) {
                 // set is ordered, so this must hold
-                assert(i == *l++ && "Labels have a gap");
+                // (as 255 is the last possible label)
+                assert((*l == 255 || i == *l++) && "Labels have a gap");
             }
 #endif
         }

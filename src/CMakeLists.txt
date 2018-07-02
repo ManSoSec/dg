@@ -5,6 +5,8 @@ add_library(PTA SHARED
 	analysis/Offset.h
 	analysis/Offset.cpp
 	analysis/PointsTo/Pointer.h
+	analysis/PointsTo/PointsToSet.h
+	analysis/PointsTo/MemoryObject.h
 	analysis/PointsTo/Pointer.cpp
 	analysis/PointsTo/PointerSubgraph.h
 	analysis/PointsTo/PointerAnalysis.h
@@ -38,6 +40,9 @@ add_library(LLVMpta SHARED
 	llvm/analysis/PointsTo/PointerSubgraphValidator.cpp
 	llvm/analysis/PointsTo/Structure.cpp
 	llvm/analysis/PointsTo/Globals.cpp
+	llvm/analysis/PointsTo/Constants.cpp
+	llvm/analysis/PointsTo/Instructions.cpp
+	llvm/analysis/PointsTo/Calls.cpp
 )
 
 target_link_libraries(LLVMpta PUBLIC PTA)
@@ -59,6 +64,9 @@ add_library(LLVMdg SHARED
 	Node.h
 	DependenceGraph.h
 	ADT/DGContainer.h
+	ADT/Bitvector.h
+	ADT/Bits.h
+	ADT/NumberSet.h
 	# -- LLVM
 	llvm/LLVMNode.h
 	llvm/LLVMNode.cpp
@@ -98,6 +106,8 @@ install(FILES
 install(FILES
 	analysis/PointsTo/PointerAnalysis.h
 	analysis/PointsTo/Pointer.h
+	analysis/PointsTo/PointsToSet.h
+	analysis/PointsTo/MemoryObject.h
 	analysis/PointsTo/PointerSubgraph.h
 	analysis/PointsTo/PointerSubgraphValidator.h
 	analysis/PointsTo/PointsToFlowInsensitive.h

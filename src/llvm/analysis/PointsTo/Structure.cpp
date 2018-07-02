@@ -196,8 +196,8 @@ void LLVMPointerSubgraphBuilder::addProgramStructure(const llvm::Function *F,
     assert(lastNode);
 
     // add successors in one basic block
-    for (const llvm::BasicBlock& block : *F)
-        buildBlockStructure(block);
+    for (const llvm::BasicBlock* block : subg.llvmBlocks)
+        buildBlockStructure(*block);
 
     // check whether we create the entry block. If not, we would
     // have a problem while adding successors, so fake that
@@ -247,6 +247,14 @@ void LLVMPointerSubgraphBuilder::addProgramStructure(const llvm::Function *F,
     //assert(!rets.empty() && "BUG: Did not find any return node in function");
     for (PSNode *r : rets) {
         r->addSuccessor(subg.ret);
+    }
+
+    // set parents of nodes
+    // FIXME: we should do this when creating the nodes
+    std::set<PSNode *> cont;
+    getNodes(cont, subg.root, subg.ret, 0xdead);
+    for (PSNode* n : cont) {
+        n->setParent(subg.root);
     }
 
     subg.has_structure = true;

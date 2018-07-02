@@ -26,14 +26,21 @@ protected:
     std::string errors{};
     std::string warnings{};
 
-    virtual bool reportInvalNumberOfOperands(const PSNode *);
+    virtual bool reportInvalOperands(const PSNode *n, const std::string& user_err = "");
+    virtual bool reportInvalEdges(const PSNode *n, const std::string& user_err = "");
+    virtual bool reportInvalNode(const PSNode *n, const std::string& user_err = "");
+    virtual bool reportUnreachableNode(const PSNode *);
+
+    virtual bool warn(const PSNode *n, const std::string& warning);
 
 public:
     PointerSubgraphValidator(const PointerSubgraph *ps) : PS(ps) {}
     virtual ~PointerSubgraphValidator() = default;
 
     bool validate();
+
     const std::string& getErrors() const { return errors; }
+    const std::string& getWarnings() const { return warnings; }
 };
 
 } // namespace debug
