@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "Pointer.h"
+#include "MemoryObject.h"
 #include "PointerSubgraph.h"
 #include "ADT/Queue.h"
 
@@ -158,6 +159,16 @@ public:
 
         assert(to_process.empty());
         assert(changed.empty());
+
+        // NOTE: With flow-insensitive analysis, it may happen that
+        // we have not reached the fixpoint here. This is beacuse
+        // we queue only reachable nodes from the nodes that changed
+        // something. So if in the rechable nodes something generates
+        // new information, than this information could be added to some
+        // node in a new iteration over all nodes. But this information
+        // can never get to that node in runtime, since that node is
+        // unreachable from the point where the information is
+        // generated, so this is OK.
     }
 
     // generic error

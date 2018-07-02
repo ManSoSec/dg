@@ -32,6 +32,8 @@ protected:
     std::vector<NodeT *> predecessors;
     // XXX: maybe we could use SmallPtrVector or something like that
     std::vector<NodeT *> operands;
+    // nodes that use this node
+    std::vector<NodeT *> users;
 
     // size of the memory
     size_t size;
@@ -99,6 +101,19 @@ public:
         return operands[idx];
     }
 
+    void setOperand(int idx, NodeT *nd)
+    {
+        assert(idx >= 0 && static_cast<size_t>(idx) < operands.size()
+               && "Operand index out of range");
+
+        operands[idx] = nd;
+    }
+
+
+    const std::vector<NodeT *>& getUsers() const {
+        return users;
+    }
+
     size_t getOperandsNum() const
     {
         return operands.size();
@@ -108,7 +123,21 @@ public:
     {
         assert(n && "Passed nullptr as the operand");
         operands.push_back(n);
+        n->addUser(static_cast<NodeT *>(this));
+        assert(n->users.size() > 0);
+
         return operands.size();
+    }
+
+    bool hasOperand(NodeT *n) const
+    {
+        for (NodeT *x : operands) {
+            if (x == n) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     void addSuccessor(NodeT *succ)
@@ -141,18 +170,20 @@ public:
         assert(successors.size() == 1);
         NodeT *old = successors[0];
 
-        // replace the successor
-        successors.clear();
-        addSuccessor(succ);
-
         // we need to remove this node from
         // successor's predecessors
         std::vector<NodeT *> tmp;
-        tmp.reserve(old->predecessorsNum() - 1);
-        for (NodeT *p : old->predecessors)
-            tmp.push_back(p);
+        tmp.reserve(old->predecessorsNum());
+        for (NodeT *p : old->predecessors) {
+            if (p != this)
+                tmp.push_back(p);
+        }
 
         old->predecessors.swap(tmp);
+
+        // replace the successor
+        successors.clear();
+        addSuccessor(succ);
     }
 
     // get successor when we know there's only one of them
@@ -240,6 +271,63 @@ public:
         seq.second->addSuccessor(this);
     }
 
+    void isolate() {
+        // Remove this node from successors of the predecessors
+        for (NodeT *pred : predecessors) {
+            std::vector<NodeT *> new_succs;
+            new_succs.reserve(pred->successors.size());
+
+            for (NodeT *n : pred->successors) {
+                if (n != this)
+                    new_succs.push_back(n);
+            }
+
+            new_succs.swap(pred->successors);
+        }
+
+        // remove this nodes from successors' predecessors
+        for (NodeT *succ : successors) {
+            std::vector<NodeT *> new_preds;
+            new_preds.reserve(succ->predecessors.size());
+
+            for (NodeT *n : succ->predecessors) {
+                if (n != this)
+                    new_preds.push_back(n);
+            }
+
+            new_preds.swap(succ->predecessors);
+        }
+
+        // Take every predecessor and connect it to every successor.
+        for (NodeT *pred : predecessors) {
+            for (NodeT *succ : successors) {
+                assert(succ != this && "Self-loop");
+                pred->addSuccessor(succ);
+            }
+        }
+
+        successors.clear();
+        predecessors.clear();
+    }
+
+    void replaceAllUsesWith(NodeT *nd, bool removeDupl = false) {
+        // Replace 'this' in every user with 'nd'.
+        for (NodeT *user : users) {
+            for (int i = 0, e = user->getOperandsNum(); i < e; ++i) {
+                if (user->getOperand(i) == this) {
+                    user->setOperand(i, nd);
+                    // register that 'nd' is now used in 'user'
+                    nd->addUser(user);
+                }
+            }
+
+            if (removeDupl)
+                user->removeDuplicitOperands();
+        }
+
+        users.clear();
+    }
+
     size_t predecessorsNum() const
     {
         return predecessors.size();
@@ -248,6 +336,37 @@ public:
     size_t successorsNum() const
     {
         return successors.size();
+    }
+
+private:
+    bool removeDuplicitOperands() {
+        std::set<NodeT *> ops;
+        bool duplicated = false;
+        for (auto op : getOperands()) {
+            if (!ops.insert(op).second)
+                duplicated = true;
+        }
+
+        if (duplicated) {
+            operands.clear();
+            operands.reserve(ops.size());
+            // just push the new operads,
+            // the users should not change in this case
+            // (as we just remove the duplicated ones)
+            for (auto op : ops)
+                operands.push_back(op);
+        }
+
+        return duplicated;
+    }
+
+    void addUser(NodeT *nd) {
+        // do not add duplicate users
+        for (auto u : users)
+            if (u == nd)
+                return;
+
+        users.push_back(nd);
     }
 };
 

@@ -34,12 +34,36 @@ add_executable(reaching-definitions-test reaching-definitions-test.cpp)
 add_test(reaching-definitions-test reaching-definitions-test)
 add_dependencies(check reaching-definitions-test)
 target_link_libraries(reaching-definitions-test PRIVATE RD)
+
 # --------------------------------------------------
 # adt-test
 # --------------------------------------------------
 add_executable(adt-test adt-test.cpp ../src/analysis/Offset.cpp)
 add_test(adt-test adt-test)
 add_dependencies(check adt-test)
+
+# --------------------------------------------------
+# bitvector-test
+# --------------------------------------------------
+add_executable(bitvector-test bitvector-test.cpp)
+add_test(bitvector-test bitvector-test)
+add_dependencies(check bitvector-test)
+
+# --------------------------------------------------
+# numbers-set-test
+# --------------------------------------------------
+add_executable(numbers-set-test numbers-set-test.cpp)
+add_test(numbers-set-test numbers-set-test)
+add_dependencies(check numbers-set-test)
+
+# --------------------------------------------------
+# points-to-set-test
+# --------------------------------------------------
+add_executable(points-to-set-test points-to-set-test.cpp  ../src/analysis/Offset.cpp)
+add_test(points-to-set-test points-to-set-test)
+add_dependencies(check points-to-set-test)
+
+
 
 # --------------------------------------------------
 # llvm-dg-test
@@ -91,6 +115,7 @@ if (LLVM_DG)
 	add_test(slicing-funcptr11 slicing-funcptr11.sh)
 	add_test(slicing-funcptr12 slicing-funcptr12.sh)
 	add_test(slicing-funcptr13 slicing-funcptr13.sh)
+	add_test(slicing-funcptr-regression1 slicing-funcptr-regression1.sh)
 	add_test(slicing-funcarray1 slicing-funcarray1.sh)
 	add_test(slicing-funcarray2 slicing-funcarray2.sh)
 	add_test(slicing-funcarray3 slicing-funcarray3.sh)
@@ -194,3 +219,5 @@ endif (LLVM_DG)
 
 add_executable(rdmap-benchmark rdmap-benchmark.cpp)
 target_link_libraries(rdmap-benchmark RD)
+
+add_executable(ptset-benchmark ptset-benchmark.cpp  ../src/analysis/Offset.cpp)

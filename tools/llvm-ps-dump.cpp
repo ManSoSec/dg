@@ -53,6 +53,7 @@ using dg::debug::TimeMeasure;
 using llvm::errs;
 
 static bool verbose;
+static bool ids_only = false;
 
 std::unique_ptr<PointerAnalysis> PA;
 
@@ -102,9 +103,13 @@ printName(PSNode *node, bool dot)
     }
 
     if (!name) {
+        if (ids_only) {
+            printf(" <%u>", node->getID());
+            return;
+        }
+
         if (!node->getUserData<llvm::Value>()) {
-            printPSNodeType(node->getType());
-            printf("\\n");
+            printf("<%u> (no name)\\n", node->getID());
             if (node->getType() == PSNodeType::CONSTANT) {
                 dumpPointer(*(node->pointsTo.begin()), dot);
             } else if (node->getType() == PSNodeType::CALL_RETURN) {
@@ -122,6 +127,11 @@ printName(PSNode *node, bool dot)
 
         nm = getInstName(node->getUserData<llvm::Value>());
         name = nm.c_str();
+    }
+
+    if (ids_only) {
+        printf(" <%u>", node->getID());
+        return;
     }
 
     // escape the " character
@@ -217,9 +227,9 @@ dumpPointerSubgraphData(PSNode *n, PTType type, bool dot = false)
             return;
 
         if (dot)
-            printf("\\n    Memory map: [%p]\\n", mm);
+            printf("\\n    Memory map: [%p]\\n", static_cast<void*>(mm));
         else
-            printf("    Memory map: [%p]\n", mm);
+            printf("    Memory map: [%p]\n", static_cast<void*>(mm));
 
         dumpMemoryMap(mm, 6, dot);
 
@@ -232,7 +242,9 @@ static void
 dumpPSNode(PSNode *n, PTType type)
 {
     printf("NODE %3u: ", n->getID());
-    printName(n, false);
+    printf("Ty: ");
+    printPSNodeType(n->getType());
+    printf("\\n");
 
     PSNodeAlloc *alloc = PSNodeAlloc::get(n);
     if (alloc &&
@@ -270,10 +282,11 @@ dumpPointerSubgraphdot(LLVMPointerAnalysis *pta, PTType type)
     for (PSNode *node : nodes) {
         if (!node)
             continue;
-        printf("\tNODE%p [label=\"<%u> ", node, node->getID());
+        printf("\tNODE%u [label=\"<%u> ", node->getID(), node->getID());
+        printPSNodeType(node->getType());
+        printf("\\n");
         printName(node, true);
-        printf("\\n--- parent ---\\n");
-        printf("%p \\n", node->getParent());
+        printf("\\nparent: %u\\n", node->getParent() ? node->getParent()->getID() : 0);
 
         PSNodeAlloc *alloc = PSNodeAlloc::get(node);
         if (alloc && (alloc->getSize() || alloc->isHeap() || alloc->isZeroInitialized()))
@@ -322,8 +335,15 @@ dumpPointerSubgraphdot(LLVMPointerAnalysis *pta, PTType type)
         if (!node) // node id 0 is nullptr
             continue;
 
-        for (PSNode *succ : node->getSuccessors())
-            printf("\tNODE%p -> NODE%p [penwidth=2]\n", node, succ);
+        for (PSNode *succ : node->getSuccessors()) {
+            printf("\tNODE%u -> NODE%u [penwidth=2]\n",
+                   node->getID(), succ->getID());
+        }
+
+        for (PSNode *op : node->getOperands()) {
+            printf("\tNODE%u -> NODE%u [color=blue,style=dotted,constraint=false]\n",
+                   op->getID(), node->getID());
+        }
     }
 
     printf("}\n");
@@ -364,9 +384,11 @@ int main(int argc, char *argv[])
             else if (strcmp(argv[i+1], "inv") == 0)
                 type = WITH_INVALIDATE;
         } else if (strcmp(argv[i], "-pta-field-sensitive") == 0) {
-            field_senitivity = (uint64_t) atoll(argv[i + 1]);
+            field_senitivity = static_cast<uint64_t>(atoll(argv[i + 1]));
         } else if (strcmp(argv[i], "-dot") == 0) {
             todot = true;
+        } else if (strcmp(argv[i], "-ids-only") == 0) {
+            ids_only = true;
         } else if (strcmp(argv[i], "-v") == 0) {
             verbose = true;
         } else {

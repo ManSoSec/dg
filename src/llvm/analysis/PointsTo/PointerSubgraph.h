@@ -6,10 +6,12 @@
 #include <llvm/Support/raw_os_ostream.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/IntrinsicInst.h>
+#include <llvm/IR/DataLayout.h>
 #include <llvm/IR/Constants.h>
 
 #include "llvm/MemAllocationFuncs.h"
 #include "analysis/PointsTo/PointerSubgraph.h"
+#include "analysis/PointsTo/PointsToMapping.h"
 #include "analysis/PointsTo/Pointer.h"
 
 namespace dg {
@@ -21,6 +23,9 @@ using PSNodesSeq = std::pair<PSNode *, PSNode *>;
 class LLVMPointerSubgraphBuilder
 {
     PointerSubgraph PS;
+    // mapping from llvm values to PSNodes that contain
+    // the points-to information
+    PointsToMapping<const llvm::Value *> mapping;
 
     const llvm::Module *M;
     const llvm::DataLayout *DL;
@@ -34,32 +39,39 @@ class LLVMPointerSubgraphBuilder
     // should be created
     bool invalidate_nodes = false;
 
+    struct Subgraph {
+        Subgraph(PSNode *r1, PSNode *r2, PSNode *va = nullptr)
+            : root(r1), ret(r2), vararg(va) {}
+        /*
+        Subgraph(PSNode *r1, PSNode *r2, PSNode *va,
+                 std::vector<const llvm::BasicBlock *>&& blcks)
+            : root(r1), ret(r2), vararg(va), llvmBlocks(blcks) {}
+            */
+        Subgraph() = default;
+        Subgraph(Subgraph&&) = default;
+        Subgraph(const Subgraph&) = delete;
+
+        // first and last nodes of the subgraph
+        PSNode *root{nullptr};
+        PSNode *ret{nullptr};
+
+        // this is the node where we gather the variadic-length arguments
+        PSNode *vararg{nullptr};
+
+        // reachable LLVM block (those block for which we built the instructions)
+        std::vector<const llvm::BasicBlock *> llvmBlocks;
+        bool has_structure = false;
+    };
+
     // build pointer state subgraph for given graph
     // \return   root node of the graph
-    PSNode *buildFunction(const llvm::Function& F);
+    Subgraph& buildFunction(const llvm::Function& F);
     PSNodesSeq buildInstruction(const llvm::Instruction&);
-    PSNode *buildNode(const llvm::Value *val);
 
     void buildPointerSubgraphBlock(const llvm::BasicBlock& block);
 
     PSNodesSeq buildArguments(const llvm::Function& F);
     PSNodesSeq buildGlobals();
-
-    void transitivelyBuildUses(const llvm::Value *val);
-
-    struct Subgraph {
-        Subgraph(PSNode *r1, PSNode *r2, PSNode *va = nullptr)
-            : root(r1), ret(r2), vararg(va) {}
-        Subgraph(): root(nullptr), ret(nullptr), vararg(nullptr) {}
-
-        // first and last nodes of the subgraph
-        PSNode *root;
-        PSNode *ret;
-
-        // this is the node where we gather the variadic-length arguments
-        PSNode *vararg;
-        bool has_structure = false;
-    };
 
     // add edges that are derived from CFG to the subgraph
     void addProgramStructure();
@@ -77,6 +89,8 @@ class LLVMPointerSubgraphBuilder
     std::map<const llvm::BasicBlock *, PSNodesSeq> built_blocks;
 
 public:
+    const PointerSubgraph *getPS() const { return &PS; }
+
     // \param field_sensitivity -- how much should be the PS field sensitive:
     //        Offset::UNKNOWN means full field sensitivity, 0 means field insensivity
     //        (every pointer with offset greater than 0 will have Offset::UNKNOWN)
@@ -90,12 +104,6 @@ public:
     // PointerSubgraph *buildLLVMPointerSubgraph();
     PointerSubgraph *buildLLVMPointerSubgraph(llvm::Function *entry = nullptr);
 
-    // create subgraph of function @F (the nodes)
-    // and call+return nodes to/from it. This function
-    // won't add the CFG edges if not @with_structure
-    PSNodesSeq
-    createCallToFunction(const llvm::Function *F);
-
     PSNodesSeq
     createFuncptrCall(const llvm::CallInst *CInst,
                       const llvm::Function *F);
@@ -105,6 +113,41 @@ public:
     // map the points-to informatio back to LLVM nodes
     const std::unordered_map<const llvm::Value *, PSNodesSeq>&
                                 getNodesMap() const { return nodes_map; }
+
+    // this is the same as the getNode, but it
+    // creates ConstantExpr
+    PSNode *getPointsTo(const llvm::Value *val)
+    {
+        PSNode *n = getMapping(val);
+        if (!n)
+            n = getConstant(val);
+
+        return n;
+    }
+
+    void setInvalidateNodesFlag(bool value) 
+    {
+        assert(PS.getRoot() == nullptr &&
+                "This function must be called before building PS");
+        this->invalidate_nodes = value;
+    }
+
+    void composeMapping(PointsToMapping<PSNode *>&& rhs) {
+        mapping.compose(std::move(rhs));
+    }
+
+private:
+
+    // create subgraph of function @F (the nodes)
+    // and call+return nodes to/from it. This function
+    // won't add the CFG edges if not 'ad_hoc_building'
+    // is set to true
+    PSNodesSeq
+    createCallToFunction(const llvm::CallInst *, const llvm::Function *);
+
+    PSNode *getMapping(const llvm::Value *val) {
+        return mapping.get(val);
+    }
 
     PSNode *getNode(const llvm::Value *val)
     {
@@ -121,42 +164,32 @@ public:
         return it->second.second;
     }
 
-    // this is the same as the getNode, but it
-    // creates ConstantExpr
-    PSNode *getPointsTo(const llvm::Value *val)
-    {
-        PSNode *n = getNode(val);
-        if (!n)
-            n = getConstant(val);
-
+    void setMapping(const llvm::Value *val, PSNode *node) {
         // if this is a call that returns a pointer,
         // then the points-to is in CALL_RETURN node
-        if (n && (n->getType() == PSNodeType::CALL
-            || n->getType() == PSNodeType::CALL_FUNCPTR))
-            n = n->getPairedNode();
+        if (node->getType() == PSNodeType::CALL
+            || node->getType() == PSNodeType::CALL_FUNCPTR)
+            node = node->getPairedNode();
 
-        return n;
+        mapping.add(val, node);
     }
 
-    void setInvalidateNodesFlag(bool value) 
-    {
-        this->invalidate_nodes = value;
-    }
-
-private:
     void addNode(const llvm::Value *val, PSNode *node)
     {
         nodes_map.emplace(val, std::make_pair(node, node));
         node->setUserData(const_cast<llvm::Value *>(val));
+
+        setMapping(val, node);
     }
 
     void addNode(const llvm::Value *val, PSNodesSeq seq)
     {
         nodes_map.emplace(val, seq);
         seq.second->setUserData(const_cast<llvm::Value *>(val));
+
+        setMapping(val, seq.second);
     }
 
-    bool typeCanBePointer(llvm::Type *Ty) const;
     bool isRelevantInstruction(const llvm::Instruction& Inst);
 
     PSNode *createAlloc(const llvm::Instruction *Inst);
@@ -219,8 +252,9 @@ private:
 
     PSNodesSeq createExtract(const llvm::Instruction *Inst);
     PSNodesSeq createCall(const llvm::Instruction *Inst);
-    PSNodesSeq createOrGetSubgraph(const llvm::CallInst *,
-                                   const llvm::Function *);
+    PSNodesSeq createFunctionCall(const llvm::CallInst *, const llvm::Function *);
+    PSNodesSeq createFuncptrCall(const llvm::CallInst *, const llvm::Value *);
+    Subgraph& createOrGetSubgraph(const llvm::Function *);
 
 
     PSNode *handleGlobalVariableInitializer(const llvm::Constant *C,
@@ -237,6 +271,143 @@ private:
     PSNodesSeq createIntrinsic(const llvm::Instruction *Inst);
     PSNodesSeq createVarArg(const llvm::IntrinsicInst *Inst);
 };
+
+/// --------------------------------------------------------
+// Helper functions
+/// --------------------------------------------------------
+inline unsigned getPointerBitwidth(const llvm::DataLayout *DL,
+                                          const llvm::Value *ptr)
+
+{
+    const llvm::Type *Ty = ptr->getType();
+    return DL->getPointerSizeInBits(Ty->getPointerAddressSpace());
+}
+
+inline uint64_t getConstantValue(const llvm::Value *op)
+{
+    using namespace llvm;
+
+    //XXX: we should get rid of this dependency
+    static_assert(sizeof(Offset::type) == sizeof(uint64_t),
+                  "The code relies on Offset::type having 8 bytes");
+
+    uint64_t size = Offset::UNKNOWN;
+    if (const ConstantInt *C = dyn_cast<ConstantInt>(op)) {
+        size = C->getLimitedValue();
+    }
+
+    // size is ~((uint64_t)0) if it is unknown
+    return size;
+}
+
+// get size of memory allocation argument
+inline uint64_t getConstantSizeValue(const llvm::Value *op) {
+    auto sz = getConstantValue(op);
+    // if the size is unknown, make it 0, so that pointer
+    // analysis correctly computes offets into this memory
+    // (which is always UNKNOWN)
+    if (sz == ~static_cast<uint64_t>(0))
+        return 0;
+    return sz;
+}
+
+inline uint64_t getAllocatedSize(const llvm::AllocaInst *AI,
+                                 const llvm::DataLayout *DL)
+{
+    llvm::Type *Ty = AI->getAllocatedType();
+    if (!Ty->isSized())
+            return 0;
+
+    if (AI->isArrayAllocation()) {
+        return getConstantSizeValue(AI->getArraySize()) * DL->getTypeAllocSize(Ty);
+    } else
+        return DL->getTypeAllocSize(Ty);
+}
+
+inline bool isConstantZero(const llvm::Value *val)
+{
+    using namespace llvm;
+
+    if (const ConstantInt *C = dyn_cast<ConstantInt>(val))
+        return C->isZero();
+
+    return false;
+}
+
+inline bool isRelevantIntrinsic(const llvm::Function *func)
+{
+    using namespace llvm;
+
+    switch (func->getIntrinsicID()) {
+        case Intrinsic::memmove:
+        case Intrinsic::memcpy:
+        case Intrinsic::vastart:
+        case Intrinsic::stacksave:
+        case Intrinsic::stackrestore:
+            return true;
+        // case Intrinsic::memset:
+        default:
+            return false;
+    }
+}
+
+inline bool isInvalid(const llvm::Value *val)
+{
+    using namespace llvm;
+
+    if (!isa<Instruction>(val)) {
+        if (!isa<Argument>(val) && !isa<GlobalValue>(val))
+            return true;
+    } else {
+        if (isa<ICmpInst>(val) || isa<FCmpInst>(val)
+            || isa<DbgValueInst>(val) || isa<BranchInst>(val)
+            || isa<SwitchInst>(val))
+            return true;
+
+        const CallInst *CI = dyn_cast<CallInst>(val);
+        if (CI) {
+            const Function *F = CI->getCalledFunction();
+            if (F && F->isIntrinsic() && !isRelevantIntrinsic(F))
+                return true;
+        }
+    }
+
+    return false;
+}
+
+inline bool memsetIsZeroInitialization(const llvm::IntrinsicInst *I)
+{
+    return isConstantZero(I->getOperand(1));
+}
+
+// recursively find out if type contains a pointer type as a subtype
+// (or if it is a pointer type itself)
+inline bool tyContainsPointer(const llvm::Type *Ty)
+{
+    if (Ty->isAggregateType()) {
+        for (auto I = Ty->subtype_begin(), E = Ty->subtype_end();
+             I != E; ++I) {
+            if (tyContainsPointer(*I))
+                return true;
+        }
+    } else
+        return Ty->isPointerTy();
+
+    return false;
+}
+
+inline bool typeCanBePointer(const llvm::DataLayout *DL, llvm::Type *Ty)
+{
+    if (Ty->isPointerTy())
+        return true;
+
+    if (Ty->isIntegerTy() && Ty->isSized())
+        return DL->getTypeSizeInBits(Ty)
+                >= DL->getPointerSizeInBits(/*Ty->getPointerAddressSpace()*/);
+
+    return false;
+}
+
 
 } // namespace pta
 } // namespace dg
