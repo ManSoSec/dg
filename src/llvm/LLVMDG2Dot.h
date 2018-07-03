@@ -50,17 +50,25 @@ static std::ostream& printLLVMVal(std::ostream& os, const llvm::Value *val)
 
     // break the string if it is too long
     std::string str = ostr.str();
-    // if (str.length() > 100) {
-    //     str.resize(40);
-    // }
+    str.erase(
+    	remove( str.begin(), str.end(), '\"' ), str.end()
+    );
+    str.erase(
+        remove( str.begin(), str.end(), '\\' ), str.end()
+    );
+    // std::string smallString = "GLOB ";
+    // str.compare(0, smallString.length(), smallString) == 0
+    if (str.length() > 200) {
+        str.resize(200);
+    }
 
     // escape the "
-    size_t pos = 0;
-    while ((pos = str.find('"', pos)) != std::string::npos) {
-        str.replace(pos, 1, "\\\"");
-        // we replaced one char with two, so we must shift after the new "
-        pos += 2;
-    }
+    //size_t pos = 0;
+    //while ((pos = str.find('"', pos)) != std::string::npos) {
+    //    str.replace(pos, 1, "\\\"");
+    //    // we replaced one char with two, so we must shift after the new "
+    //    pos += 2;
+    //}
 
     os << str;
 
