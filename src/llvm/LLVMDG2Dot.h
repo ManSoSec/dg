@@ -50,9 +50,9 @@ static std::ostream& printLLVMVal(std::ostream& os, const llvm::Value *val)
 
     // break the string if it is too long
     std::string str = ostr.str();
-    if (str.length() > 100) {
-        str.resize(40);
-    }
+    // if (str.length() > 100) {
+    //     str.resize(40);
+    // }
 
     // escape the "
     size_t pos = 0;
