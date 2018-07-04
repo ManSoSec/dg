@@ -339,6 +339,7 @@ LLVMPointerSubgraphBuilder::buildInstruction(const llvm::Instruction& Inst)
         case Instruction::FPTrunc:
         case Instruction::FPExt:
 	case Instruction::AtomicRMW:
+	case Instruction::Fence:
             // these instructions reinterpert the pointer,
             // nothing better we can do here (I think?)
             node = createUnknown(&Inst);
